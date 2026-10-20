@@ -321,7 +321,7 @@ Exit code `1` on any error/warn finding, `2` on a fatal error, else `0`.
 | `POLICY_DRIFT` | warn/info | Policy file differs from live policy (`--compare-live`) |
 | `NO_PROFILE`, `PROFILE_ACCOUNT_MISMATCH`, `ACCOUNT_ERROR`, `FMS_ERROR` | error | Account or FMS could not be checked |
 | `FIRST_RENUMBERED` / `LAST_RENUMBERED` | info | Correct and in order, but not at FMS initial numbers (1.. / ..32766) |
-| `CUSTOM_OUTSIDE_RANGE` | info | Custom rule outside the 5000–32000 range FMS recommends |
+| `CUSTOM_OUTSIDE_RANGE` | info | Rule that matches no policy first/last rule (in any position) and is numbered outside the 5000–32000 custom range |
 
 `baseline` on each finding is `file`, `live`, or `file-vs-live`.
 

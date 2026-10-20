@@ -427,15 +427,19 @@ def analyze_nacl(nacl: dict, baselines: list[Baseline], ctx: dict, limit: int, h
             first, last = bl.block("first", egress), bl.block("last", egress)
             out += check_block("first", first, live, mk)
             out += check_block("last", last, live, mk)
-            # Custom rules numbered inside the FMS-reserved ranges.
-            fms_slots = live[:len(first)] + (live[-len(last):] if last else [])
-            fms_numbers = {e.number for e in fms_slots}
-            for e in live:
-                if e.number in fms_numbers:
-                    continue
-                if not (CUSTOM_RANGE[0] <= e.number <= CUSTOM_RANGE[1]):
-                    out.append(mk("info", "CUSTOM_OUTSIDE_RANGE", "", None, e,
-                                  f"custom rule outside {CUSTOM_RANGE[0]}-{CUSTOM_RANGE[1]}"))
+
+        # Custom rules numbered outside the custom range. Any entry matching a policy
+        # first/last rule (any baseline, any position) is a policy rule, not custom;
+        # misplaced policy rules are already reported by check_block.
+        policy_keys = {e.key() for bl in baselines
+                       for e in bl.block("first", egress) + bl.block("last", egress)}
+        for e in live:
+            if e.key() in policy_keys or CUSTOM_RANGE[0] <= e.number <= CUSTOM_RANGE[1]:
+                continue
+            out.append(Finding(severity="info", code="CUSTOM_OUTSIDE_RANGE", baseline="", **base,
+                               direction=direction, actual=str(e),
+                               detail=f"rule matches no policy first/last rule and is outside the "
+                                      f"custom range {CUSTOM_RANGE[0]}-{CUSTOM_RANGE[1]}"))
     return out
 
 
