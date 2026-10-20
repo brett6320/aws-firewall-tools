@@ -215,8 +215,8 @@ network ACLs in each account through a **local AWS profile** for that account,
 and reports:
 
 - **First / last rule drift** — per direction, the lowest-numbered live entries
-  must equal the policy's `firstEntries` and the highest-numbered (below the
-  `*` default) must equal `lastEntries`, in order. Compared fields: action,
+  must equal the policy's `FirstEntries` and the highest-numbered (below the
+  `*` default) must equal `LastEntries`, in order. Compared fields: action,
   protocol, CIDR, port range, ICMP type/code.
 - **Duplicate rules** — the same action / protocol / CIDR / ports / ICMP at
   more than one rule number in a direction (`DUPLICATE_RULE`). Only the
@@ -258,7 +258,9 @@ a fatal error. `--policy` that matches nothing in the scanned regions is also
 fatal rather than a clean pass.
 
 A policy file may be `aws fms get-policy` output, the bare `Policy` object, or
-bare `ManagedServiceData`. The
+a bare `NetworkAclEntrySet`. Rules are read from
+`SecurityServicePolicyData.PolicyOption.NetworkAclCommonPolicy.NetworkAclEntrySet`
+(`FirstEntries` / `LastEntries`); a policy with neither is a fatal error. The
 policy is located in FMS by `--policy`, else the file's `PolicyId` /
 `PolicyName`. Tag scope (`ResourceTags`) comes from the file when present,
 else from the live policy.

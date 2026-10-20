@@ -7,7 +7,7 @@ member accounts in scope (from FMS compliance status), reads the live network
 ACLs in each account through a matching local AWS profile, and reports:
 
   * first / last rules that are missing, different, or out of position
-    compared to the policy's networkAclEntrySet
+    compared to the policy's NetworkAclEntrySet
   * network ACLs whose rule count per direction is at the limit (default 30)
     or within headroom of it (default 3)
   * duplicate rules (identical entry at more than one rule number)
@@ -15,8 +15,9 @@ ACLs in each account through a matching local AWS profile, and reports:
   * VPC default network ACLs holding anything besides the '*' deny-all rules
     (default NACLs are never checked against the policy)
 
-The expected rules come from a policy file when one is given (get-policy JSON,
-the Policy object, or bare ManagedServiceData); otherwise from the live policy.
+The expected rules (SecurityServicePolicyData.PolicyOption.NetworkAclCommonPolicy
+.NetworkAclEntrySet) come from a policy file when one is given (get-policy JSON,
+the Policy object, or a bare NetworkAclEntrySet); otherwise from the live policy.
 --compare-live diffs a policy file against the live policy and checks NACLs
 against both.
 
@@ -99,17 +100,8 @@ class Entry:
 
     @classmethod
     def from_policy(cls, e: dict) -> "Entry":
-        proto = normalize_proto(_g(e, "protocol", "-1"))
-        pr = e.get("portRange")
-        ic = e.get("icmpTypeCode")
-        return cls(
-            egress=bool(e.get("egress", False)),
-            action=str(_g(e, "ruleAction", "")).lower(),
-            proto=proto,
-            cidr=_norm_cidr(e.get("cidrBlock") or e.get("ipv6CidrBlock") or ""),
-            ports=(int(pr["from"]), int(pr["to"])) if pr and proto in ("tcp", "udp") else None,
-            icmp=(int(ic.get("type", -1)), int(ic.get("code", -1))) if ic and proto in ("icmp", "icmpv6") else None,
-        )
+        """FMS NetworkAclEntry: same shape as an EC2 entry, minus RuleNumber."""
+        return cls.from_live({**e, "RuleNumber": None})
 
     @classmethod
     def from_live(cls, e: dict) -> "Entry":
@@ -123,7 +115,7 @@ class Entry:
             cidr=_norm_cidr(e.get("CidrBlock") or e.get("Ipv6CidrBlock") or ""),
             ports=(int(pr["From"]), int(pr["To"])) if pr and proto in ("tcp", "udp") else None,
             icmp=(int(ic.get("Type", -1)), int(ic.get("Code", -1))) if ic and proto in ("icmp", "icmpv6") else None,
-            number=int(e["RuleNumber"]),
+            number=None if e.get("RuleNumber") is None else int(e["RuleNumber"]),
         )
 
     def key(self) -> tuple:
@@ -217,38 +209,44 @@ def _err(e: Exception) -> str:
 # --------------------------------------------------------------------------- #
 # Policy loading
 # --------------------------------------------------------------------------- #
-def _msd_from(obj: dict) -> dict | None:
-    """Pull ManagedServiceData (as dict) out of any of the accepted shapes."""
-    if "networkAclEntrySet" in obj:
+def _entry_set_from(obj: dict) -> dict | None:
+    """NetworkAclEntrySet from a Policy object
+    (SecurityServicePolicyData.PolicyOption.NetworkAclCommonPolicy.NetworkAclEntrySet),
+    or a bare NetworkAclEntrySet."""
+    if "FirstEntries" in obj or "LastEntries" in obj:
         return obj
     ssp = _g(obj, "SecurityServicePolicyData", None)
     if ssp is None:
         return None
-    raw = ssp.get("ManagedServiceData") or "{}"
-    return json.loads(raw) if isinstance(raw, str) else raw
+    ptype = ssp.get("Type")
+    if ptype and ptype != NACL_POLICY_TYPE:
+        raise ValueError(f"policy type is {ptype}, not {NACL_POLICY_TYPE}")
+    return _g(_g(_g(ssp, "PolicyOption", {}), "NetworkAclCommonPolicy", {}), "NetworkAclEntrySet", None)
 
 
 def baseline_from_policy(policy: dict, source: str) -> Baseline:
-    msd = _msd_from(policy)
-    if msd is None:
-        raise ValueError("no ManagedServiceData / networkAclEntrySet found")
-    if msd.get("type", NACL_POLICY_TYPE) != NACL_POLICY_TYPE:
-        raise ValueError(f"policy type is {msd.get('type')}, not {NACL_POLICY_TYPE}")
-    es = _g(msd, "networkAclEntrySet", {})
-    return Baseline(
+    es = _entry_set_from(policy)
+    if es is None:
+        raise ValueError(f"{source} policy: no SecurityServicePolicyData.PolicyOption."
+                         "NetworkAclCommonPolicy.NetworkAclEntrySet found")
+    bl = Baseline(
         source=source,
         policy_id=policy.get("PolicyId", ""),
         policy_name=policy.get("PolicyName", ""),
-        first=[Entry.from_policy(e) for e in _g(es, "firstEntries", [])],
-        last=[Entry.from_policy(e) for e in _g(es, "lastEntries", [])],
-        force_first=es.get("forceRemediateForFirstEntries"),
-        force_last=es.get("forceRemediateForLastEntries"),
+        first=[Entry.from_policy(e) for e in _g(es, "FirstEntries", [])],
+        last=[Entry.from_policy(e) for e in _g(es, "LastEntries", [])],
+        force_first=es.get("ForceRemediateForFirstEntries"),
+        force_last=es.get("ForceRemediateForLastEntries"),
     )
+    if not bl.first and not bl.last:
+        # Fail closed: with no expected rules every NACL would look compliant.
+        raise ValueError(f"{source} policy {bl.policy_name or bl.policy_id}: no first or last entries found")
+    return bl
 
 
 def load_policy_file(path: str) -> tuple[dict, str | None]:
     """Return (policy-ish dict, region from PolicyArn if present).
-    Accepts `aws fms get-policy` output, the bare Policy object, or bare ManagedServiceData."""
+    Accepts `aws fms get-policy` output, the bare Policy object, or a bare NetworkAclEntrySet."""
     with open(path, encoding="utf-8") as fh:
         doc = json.load(fh)
     region = None
@@ -724,7 +722,7 @@ def main() -> int:
     p.add_argument("--policy", help="Restrict to one NACL policy ID or name (also locates a policy file's policy)")
     p.add_argument("--policy-file", metavar="PATH",
                    help="Use this policy JSON as the expected rules (get-policy output, Policy object, "
-                        "or ManagedServiceData). Accounts still come from FMS")
+                        "or bare NetworkAclEntrySet). Accounts still come from FMS")
     p.add_argument("--compare-live", action="store_true",
                    help="With --policy-file: also diff the file against the live FMS policy and check NACLs "
                         "against both")
