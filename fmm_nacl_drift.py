@@ -55,9 +55,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-import boto3
-import botocore.session
-from botocore.exceptions import BotoCoreError, ClientError
+import truststore
+
+# Must run before boto3/urllib3 import: they capture ssl.SSLContext at import time,
+# and a context built from the pre-injection class recurses forever in its options setter.
+truststore.inject_into_ssl()
+
+import boto3  # noqa: E402
+import botocore.session  # noqa: E402
+from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
 from fmm_parity import _g, get_client, get_policy, get_session, list_policies, normalize_proto, resolve_regions
 
