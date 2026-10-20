@@ -218,6 +218,9 @@ and reports:
   must equal the policy's `firstEntries` and the highest-numbered (below the
   `*` default) must equal `lastEntries`, in order. Compared fields: action,
   protocol, CIDR, port range, ICMP type/code.
+- **Duplicate rules** — the same action / protocol / CIDR / ports / ICMP at
+  more than one rule number in a direction (`DUPLICATE_RULE`). Only the
+  lowest-numbered copy is ever evaluated; the rest waste slots against the limit.
 - **Default NACLs** — VPC default NACLs are never checked against the policy
   (even with `--nacl-scope all`). Every default NACL in each scanned account
   and region must hold only the `*` deny-all rules; anything else is
@@ -313,6 +316,7 @@ Exit code `1` on any error/warn finding, `2` on a fatal error, else `0`.
 | `FIRST_OUT_OF_ORDER` / `LAST_OUT_OF_ORDER` | error | Expected entry exists, but at another rule number |
 | `AT_LIMIT` / `NEAR_LIMIT` | warn | Rule count at the limit / within headroom |
 | `DEFAULT_NACL_NOT_DENY_ALL` | error | VPC default NACL has a rule other than `*` deny all |
+| `DUPLICATE_RULE` | warn | Identical rule at several rule numbers in one direction; `actual` gives the rule and its numbers |
 | `NOT_FMMANAGED` | warn | In-scope subnet's (non-default) NACL lacks `FMManaged=true` |
 | `POLICY_DRIFT` | warn/info | Policy file differs from live policy (`--compare-live`) |
 | `NO_PROFILE`, `PROFILE_ACCOUNT_MISMATCH`, `ACCOUNT_ERROR`, `FMS_ERROR` | error | Account or FMS could not be checked |

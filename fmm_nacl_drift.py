@@ -10,6 +10,7 @@ ACLs in each account through a matching local AWS profile, and reports:
     compared to the policy's networkAclEntrySet
   * network ACLs whose rule count per direction is at the limit (default 30)
     or within headroom of it (default 3)
+  * duplicate rules (identical entry at more than one rule number)
   * in-scope network ACLs not tagged FMManaged=true
   * VPC default network ACLs holding anything besides the '*' deny-all rules
     (default NACLs are never checked against the policy)
@@ -404,6 +405,19 @@ def analyze_nacl(nacl: dict, baselines: list[Baseline], ctx: dict, limit: int, h
                                actual=str(count), expected=f"< {limit - headroom}",
                                detail=f"{count} {direction} rules, limit {limit}"
                                       + (f", headroom {headroom}" if headroom else "")))
+
+        # Exact duplicates: same action/proto/cidr/ports/icmp at more than one rule number.
+        groups: dict[tuple, list[Entry]] = {}
+        for e in live:
+            groups.setdefault(e.key(), []).append(e)
+        for dups in groups.values():
+            if len(dups) > 1:
+                out.append(Finding(severity="warn", code="DUPLICATE_RULE", baseline="", **base,
+                                   direction=direction,
+                                   actual=f"{Entry(**{**asdict(dups[0]), 'number': None})} at "
+                                          + ", ".join(f"#{e.number}" for e in dups),
+                                   detail=f"same rule at {len(dups)} rule numbers; only #{dups[0].number} "
+                                          f"is ever evaluated, {len(dups) - 1} slot(s) wasted"))
 
         for bl in baselines:
             def mk(sev, code, pos, exp, got, detail, _bl=bl, _dir=direction):
