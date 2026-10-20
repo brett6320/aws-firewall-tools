@@ -520,15 +520,27 @@ def build_jobs(args, regions: list[str], findings: list[Finding]) -> list[Job]:
     jobs: list[Job] = []
     if args.policy_file:
         file_policy, file_region = load_policy_file(args.policy_file)
-        region = file_region or regions[0]
         file_bl = baseline_from_policy(file_policy, "file")
-        fms = get_client("fms", get_session(args.profile, region))
         ref = args.policy or file_bl.policy_id or file_bl.policy_name
         if not ref:
             raise ValueError("policy file has no PolicyId/PolicyName; pass --policy to find its accounts in FMS")
-        live = resolve_policy_id(fms, ref)
-        if live is None:
-            raise ValueError(f"policy {ref!r} not found in FMS region {region}")
+        if file_region:
+            if args.region and file_region not in regions:
+                log.warning("Policy file PolicyArn is in %s; ignoring --region %s", file_region, ",".join(regions))
+            search = [file_region]
+        else:
+            search = regions
+        found = []
+        for r in search:
+            pol = resolve_policy_id(get_client("fms", get_session(args.profile, r)), ref)
+            if pol is not None:
+                found.append((r, pol))
+        if not found:
+            raise ValueError(f"policy {ref!r} not found in FMS region(s) {', '.join(search)}")
+        if len(found) > 1:
+            raise ValueError(f"policy {ref!r} found in several regions ({', '.join(r for r, _ in found)}); "
+                             "pass a single --region")
+        region, live = found[0]
         file_bl.policy_id = file_bl.policy_id or live["PolicyId"]
         file_bl.policy_name = file_bl.policy_name or live["PolicyName"]
         baselines = [file_bl]
@@ -557,6 +569,9 @@ def build_jobs(args, regions: list[str], findings: list[Finding]) -> list[Job]:
                 continue
             pol = get_policy(fms, s["PolicyId"])
             jobs.append(Job(region=region, policy=pol, baselines=[baseline_from_policy(pol, "live")]))
+    if args.policy and not jobs and not any(f.code == "FMS_ERROR" for f in findings):
+        raise ValueError(f"NACL policy {args.policy!r} not found in FMS region(s) {', '.join(regions)}; "
+                         "try --region or --all-regions")
     return jobs
 
 

@@ -247,8 +247,15 @@ python fmm_nacl_drift.py --profile fms-admin --policy-file prod-nacl.json --comp
 python fmm_nacl_drift.py --profile fms-admin --headroom 0
 ```
 
-A policy file may be `aws fms get-policy` output (region taken from
-`PolicyArn`), the bare `Policy` object, or bare `ManagedServiceData`. The
+**Region.** FMS policies are regional; each policy's member accounts are
+scanned only in that policy's region. A policy file's `PolicyArn` sets the
+region (it wins over `--region`). Without one, the policy is looked up in every
+`--region` given (or `--all-regions`); not found, or found in more than one, is
+a fatal error. `--policy` that matches nothing in the scanned regions is also
+fatal rather than a clean pass.
+
+A policy file may be `aws fms get-policy` output, the bare `Policy` object, or
+bare `ManagedServiceData`. The
 policy is located in FMS by `--policy`, else the file's `PolicyId` /
 `PolicyName`. Tag scope (`ResourceTags`) comes from the file when present,
 else from the live policy.
