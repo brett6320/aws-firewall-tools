@@ -8,12 +8,35 @@ ACLs in each account through a matching local AWS profile, and reports:
 
   * first / last rules that are missing, different, or out of position
     compared to the policy's networkAclEntrySet
-  * network ACLs whose rule count per direction is at (or near) a limit
+  * network ACLs whose rule count per direction is at the limit (default 30)
+    or within headroom of it (default 3)
+  * in-scope network ACLs not tagged FMManaged=true
+  * VPC default network ACLs holding anything besides the '*' deny-all rules
+    (default NACLs are never checked against the policy)
 
 The expected rules come from a policy file when one is given (get-policy JSON,
 the Policy object, or bare ManagedServiceData); otherwise from the live policy.
 --compare-live diffs a policy file against the live policy and checks NACLs
 against both.
+
+Member account profiles are found in the local AWS config by account id;
+profiles ending in -priv or -cpar are never used.
+
+Configuration (.env, all optional; CLI flags override):
+
+    # AWS profile to use (overridden by --profile)
+    AWS_PROFILE=
+    # Default region when --region not given
+    AWS_REGION=us-east-1
+    # Base directory for auto-saved reports (<dir>/YYYY-MM-DD/...)
+    FMM_REPORT_DIR=./reports
+    # Firewall Manager administrator (security) account id. Its local profile is
+    # found by account id; --profile overrides, AWS_PROFILE is the fallback.
+    FMM_ADMIN_ACCOUNT=
+    # NACL rules-per-direction limit
+    FMM_NACL_LIMIT=30
+    # Flag NACLs within this many rules of the limit
+    FMM_NACL_HEADROOM=3
 
 Read-only. No mutating API calls are made.
 """
