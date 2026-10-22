@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-AWS Firewall Manager (FMS) network ACL drift review.
+AWS Firewall Manager (FMS) network ACL audit.
 
-Companion to fmm_parity.py. For each FMS NETWORK_ACL_COMMON policy, finds the
+Intent: FMS NACL policies only control the first and last rules of each
+NACL; teams add their own rules in between. This tool shows, across every
+member account, which NACLs no longer carry the policy's rules in the right
+order, which are close to the rules-per-NACL limit (FMS remediation needs
+spare slots), and which hold duplicate or misplaced rules, so they can be
+fixed before remediation fails or traffic is affected.
+
+Companion to fmm_rule_parity.py. For each FMS NETWORK_ACL_COMMON policy, finds the
 member accounts in scope (from FMS compliance status), reads the live network
 ACLs in each account through a matching local AWS profile, and reports:
 
@@ -30,7 +37,7 @@ Configuration (.env, all optional; CLI flags override):
     AWS_PROFILE=
     # Default region when --region not given
     AWS_REGION=us-east-1
-    # Base directory for auto-saved reports (<dir>/YYYY-MM-DD/...)
+    # Base directory for auto-saved reports (<dir>/<tool>/YYYY-MM-DD/...)
     FMM_REPORT_DIR=./reports
     # Firewall Manager administrator (security) account id. Its local profile is
     # found by account id; --profile overrides, AWS_PROFILE is the fallback.
@@ -39,6 +46,17 @@ Configuration (.env, all optional; CLI flags override):
     FMM_NACL_LIMIT=30
     # Flag NACLs within this many rules of the limit
     FMM_NACL_HEADROOM=3
+
+Reports: text on screen, plus auto-saved HTML (interactive: filter, sort,
+unique counts of accounts/VPCs/NACLs...), CSV and JSON under
+reports/fmm_nacl_audit/YYYY-MM-DD/.
+
+Usage:
+
+    ./fmm_nacl_audit.py --region us-east-1
+    ./fmm_nacl_audit.py --policy-file prod-nacl.json --compare-live
+
+Exit codes: 0 clean, 1 error or warning findings, 2 fatal error.
 
 Read-only. No mutating API calls are made.
 """
@@ -67,9 +85,10 @@ import boto3  # noqa: E402
 import botocore.session  # noqa: E402
 from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
-from fmm_parity import _g, get_client, get_policy, get_session, list_policies, normalize_proto, resolve_regions
+from lib import html_report  # noqa: E402
+from lib.aws_common import _g, get_client, get_policy, get_session, list_policies, normalize_proto, resolve_regions
 
-log = logging.getLogger("fmm_nacl_drift")
+log = logging.getLogger("fmm_nacl_audit")
 
 NACL_POLICY_TYPE = "NETWORK_ACL_COMMON"
 DEFAULT_RULE_MIN = 32767          # 32767 (IPv4 '*') and 32768 (IPv6 '*') are the immutable defaults
@@ -105,6 +124,7 @@ class Entry:
 
     @classmethod
     def from_live(cls, e: dict) -> "Entry":
+        """Parse an entry as returned by EC2 or FMS (PascalCase); RuleNumber is kept when present."""
         proto = normalize_proto(e.get("Protocol", "-1"))
         pr = e.get("PortRange")
         ic = e.get("IcmpTypeCode")
@@ -119,6 +139,7 @@ class Entry:
         )
 
     def key(self) -> tuple:
+        """Identity of an entry for comparison: direction plus every compared field, not the rule number."""
         return (self.egress,) + tuple(getattr(self, f) for f in self.FIELDS)
 
     def diff(self, other: "Entry") -> list[str]:
@@ -131,6 +152,7 @@ class Entry:
         return out
 
     def __str__(self) -> str:
+        """Human-readable entry, e.g. '#100 ingress allow tcp 443 10.0.0.0/8'."""
         num = f"#{self.number} " if self.number is not None else ""
         extra = ""
         if self.ports:
@@ -152,11 +174,13 @@ class Baseline:
     force_last: bool | None = None
 
     def block(self, which: str, egress: bool) -> list[Entry]:
+        """The policy's first or last entries for one direction, in policy order."""
         return [e for e in (self.first if which == "first" else self.last) if e.egress == egress]
 
 
 @dataclass
 class Finding:
+    """One audit result for a NACL, account or policy, as shown in the text, CSV and HTML reports."""
     severity: str                  # error | warn | info
     code: str
     region: str
@@ -182,6 +206,7 @@ CSV_COLUMNS = list(Finding.__dataclass_fields__)
 # Helpers
 # --------------------------------------------------------------------------- #
 def _norm_cidr(s: str) -> str:
+    """Canonical CIDR text (so '10.0.0.1/8' equals '10.0.0.0/8'); unparseable input is kept as is."""
     if not s:
         return ""
     try:
@@ -191,6 +216,7 @@ def _norm_cidr(s: str) -> str:
 
 
 def _fmt_val(f: str, v) -> str:
+    """Render one compared Entry field for diff messages."""
     if v is None:
         return "-"
     if f == "ports":
@@ -201,6 +227,7 @@ def _fmt_val(f: str, v) -> str:
 
 
 def _err(e: Exception) -> str:
+    """Short error text for an AWS ClientError or any other exception."""
     if isinstance(e, ClientError):
         return f"{e.response['Error']['Code']}: {e.response['Error']['Message']}"
     return f"{type(e).__name__}: {e}"
@@ -225,6 +252,11 @@ def _entry_set_from(obj: dict) -> dict | None:
 
 
 def baseline_from_policy(policy: dict, source: str) -> Baseline:
+    """Build the expected first/last rules from a policy (file or live).
+
+    Fails closed: a policy with no entry set, or with neither first nor last entries, raises
+    ValueError rather than silently checking against nothing.
+    """
     es = _entry_set_from(policy)
     if es is None:
         raise ValueError(f"{source} policy: no SecurityServicePolicyData.PolicyOption."
@@ -344,6 +376,7 @@ def subnet_in_scope(tags: dict[str, str], policy: dict) -> bool:
 # Live NACL analysis
 # --------------------------------------------------------------------------- #
 def _paginate(client, op: str, key: str, **kw) -> Iterator[dict]:
+    """Iterate every item under `key` across all pages of a paginated EC2 call."""
     for page in client.get_paginator(op).paginate(**kw):
         yield from _g(page, key, [])
 
@@ -382,6 +415,10 @@ def check_block(which: str, expected: list[Entry], live: list[Entry], mk) -> lis
 
 
 def analyze_nacl(nacl: dict, baselines: list[Baseline], ctx: dict, limit: int, headroom: int) -> list[Finding]:
+    """Check one in-scope (non-default) NACL: FMManaged tag, rule-count limit, duplicate
+    rules, the policy's first/last blocks for each baseline, and custom rules outside the
+    5000-32000 range.
+    """
     live_all = [Entry.from_live(e) for e in _g(nacl, "Entries", [])
                 if int(e["RuleNumber"]) < DEFAULT_RULE_MIN]
     subnets = sorted(a["SubnetId"] for a in _g(nacl, "Associations", []))
@@ -419,6 +456,7 @@ def analyze_nacl(nacl: dict, baselines: list[Baseline], ctx: dict, limit: int, h
 
         for bl in baselines:
             def mk(sev, code, pos, exp, got, detail, _bl=bl, _dir=direction):
+                """Build a Finding for this NACL, baseline and direction."""
                 return Finding(severity=sev, code=code, baseline=_bl.source, **base, direction=_dir,
                                position=pos, expected=str(exp) if exp else "",
                                actual=str(got) if got else "", detail=detail)
@@ -496,6 +534,7 @@ def scan_account(account: str, profile: str, region: str, policy: dict, baseline
 # Policy file vs live policy
 # --------------------------------------------------------------------------- #
 def diff_baselines(file_bl: Baseline, live_bl: Baseline, ctx: dict) -> list[Finding]:
+    """Compare a policy file's rules with the live policy's, position by position (--compare-live)."""
     out: list[Finding] = []
     for which in ("first", "last"):
         for egress in (False, True):
@@ -526,12 +565,14 @@ def diff_baselines(file_bl: Baseline, live_bl: Baseline, ctx: dict) -> list[Find
 # --------------------------------------------------------------------------- #
 @dataclass
 class Job:
+    """One policy to audit in one region, with the baseline(s) to check its NACLs against."""
     region: str
     policy: dict          # live policy, or the file's Policy object (scope/tags)
     baselines: list[Baseline]
 
 
 def resolve_policy_id(fms, ref: str) -> dict | None:
+    """Find a policy by id or name in this region and return the full policy, or None."""
     for s in list_policies(fms):
         if ref in (s["PolicyId"], s["PolicyName"]):
             return get_policy(fms, s["PolicyId"])
@@ -539,6 +580,11 @@ def resolve_policy_id(fms, ref: str) -> dict | None:
 
 
 def build_jobs(args, regions: list[str], findings: list[Finding]) -> list[Job]:
+    """Work out which policies to audit, in which region, against which baselines.
+
+    A policy file's ARN sets its region; otherwise the policy is searched for in every given
+    region. Ambiguous or missing policies raise ValueError (fatal) rather than passing quietly.
+    """
     jobs: list[Job] = []
     if args.policy_file:
         file_policy, file_region = load_policy_file(args.policy_file)
@@ -598,6 +644,9 @@ def build_jobs(args, regions: list[str], findings: list[Finding]) -> list[Job]:
 
 
 def run(args, regions: list[str]) -> tuple[list[Finding], dict]:
+    """Audit every job: list in-scope accounts from FMS, pick each account's local profile,
+    scan its NACLs, and return all findings (sorted for reporting) with run statistics.
+    """
     findings: list[Finding] = []
     jobs = build_jobs(args, regions, findings)
     pmap, overrides = profile_lookup(args)
@@ -652,6 +701,9 @@ def run(args, regions: list[str]) -> tuple[list[Finding], dict]:
 # Output
 # --------------------------------------------------------------------------- #
 def print_report(findings: list[Finding], stats: dict, show_info: bool) -> None:
+    """Print the text report: run totals, then findings grouped by region / policy / account /
+    NACL. Info findings are hidden unless `show_info`.
+    """
     print()
     print(f"Policies: {stats['policies']}   Accounts scanned: {stats['accounts']}   "
           f"skipped: {stats['accounts_skipped']}   NACLs checked: {stats['nacls']}")
@@ -683,203 +735,38 @@ def print_report(findings: list[Finding], stats: dict, show_info: bool) -> None:
         print(f"\n({hidden} info findings hidden; --show-info to list)")
 
 
-HTML_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NACL drift report</title>
-<style>
-:root { --bg:#fff; --fg:#1d2329; --muted:#5b6670; --line:#d9dee3; --card:#f6f8fa; --hl:#eef3f8;
-  --error:#b42318; --error-bg:#fde8e7; --warn:#9a6700; --warn-bg:#fff4d6; --info:#305d9c; --info-bg:#e6effa; }
-@media (prefers-color-scheme: dark) { :root { --bg:#0f1418; --fg:#e3e8ec; --muted:#97a3ad; --line:#2c353d;
-  --card:#161d23; --hl:#1b252e; --error:#ff8a80; --error-bg:#3d1714; --warn:#f2c14e; --warn-bg:#3a2e0e;
-  --info:#8ab4f8; --info-bg:#14243b; } }
-body { background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  margin:0 auto; padding:24px 16px; max-width:1600px; }
-h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:24px 0 8px; } .muted { color:var(--muted); }
-.mono, td.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; }
-.cards { display:flex; flex-wrap:wrap; gap:10px; margin:12px 0; }
-.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 14px; min-width:96px; }
-.card b { display:block; font-size:20px; } .card span { color:var(--muted); font-size:12px; }
-.controls { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:end; background:var(--card);
-  border:1px solid var(--line); border-radius:8px; padding:10px 12px; position:sticky; top:0; z-index:2; }
-.controls label { display:flex; flex-direction:column; font-size:11px; color:var(--muted); gap:2px; }
-.controls label.check { flex-direction:row; align-items:center; gap:6px; font-size:13px; color:var(--fg); }
-select, input[type=search], button { font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
-  border:1px solid var(--line); border-radius:6px; padding:4px 6px; max-width:220px; }
-input[type=search] { width:220px; } button { cursor:pointer; }
-.wrap { overflow-x:auto; }
-table { border-collapse:collapse; width:100%; margin:6px 0 12px; }
-th, td { text-align:left; vertical-align:top; padding:5px 8px; border-bottom:1px solid var(--line); }
-th { color:var(--muted); font-weight:600; font-size:12px; white-space:nowrap; cursor:pointer; user-select:none; }
-th.sorted::after { content:" \\25B2"; } th.sorted.desc::after { content:" \\25BC"; }
-tr:hover td { background:var(--hl); }
-td.nw { white-space:nowrap; } td.f { cursor:pointer; } td.f:hover { text-decoration:underline dotted; }
-.badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; font-weight:600; }
-.error { color:var(--error); background:var(--error-bg); } .warn { color:var(--warn); background:var(--warn-bg); }
-.info { color:var(--info); background:var(--info-bg); }
-</style></head><body>
-<h1>NACL drift report</h1>
-<div class="muted" id="meta"></div>
-<div class="cards" id="run"></div>
-<div class="controls" id="controls">
-  <label>Search<input type="search" id="q" placeholder="any text"></label>
-  <span id="selects" style="display:contents"></span>
-  <label class="check"><input type="checkbox" id="info"> show info</label>
-  <button id="reset">Reset</button>
-  <button id="csv">Download filtered CSV</button>
-</div>
-<h2>Matching findings <span class="muted" id="shown"></span></h2>
-<div class="cards" id="uniq"></div>
-<h2>By code</h2>
-<div class="wrap"><table id="bycode"></table></div>
-<h2>Findings</h2>
-<div class="muted">Click a header to sort (shift-click adds a secondary sort). Click a cell in a filterable column to filter on it.</div>
-<div class="wrap"><table id="tbl"></table></div>
-<script id="data" type="application/json">__DATA__</script>
-<script>
-(() => {
-const D = JSON.parse(document.getElementById("data").textContent);
-const ALL = D.findings.map(f => ({...f, subnets: (f.subnets || []).join(", ")}));
-const COLS = [["severity","Severity"],["code","Code"],["region","Region"],["policy_name","Policy"],
-  ["account","Account"],["profile","Profile"],["vpc_id","VPC"],["nacl_id","NACL"],["subnets","Subnets"],
-  ["baseline","Baseline"],["direction","Direction"],["position","Position"],["expected","Expected"],
-  ["actual","Actual"],["detail","Detail"]];
-const FILTERS = ["severity","code","region","policy_name","account","vpc_id","nacl_id","direction","baseline"];
-const WRAP = ["subnets","expected","actual","detail"];
-const LABEL = Object.fromEntries(COLS);
-const SEV = {error:0, warn:1, info:2};
-const UNIQ = [["account","Accounts"],["region","Regions"],["policy_name","Policies"],["vpc_id","VPCs"],
-  ["nacl_id","NACLs"],["subnet","Subnets"],["code","Finding codes"]];
-const st = {q:"", info:false, f:{}, sort:[["severity",1]]};
-const el = id => document.getElementById(id);
-const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const card = (n, label) => `<div class="card"><b>${n}</b><span>${esc(label)}</span></div>`;
-
-const s = D.stats || {};
-el("meta").textContent = `Generated ${D.generated}` + (D.policy ? ` · policy ${D.policy}` : "");
-el("run").innerHTML = card(s.policies ?? "-", "policies") + card(s.accounts ?? "-", "accounts scanned") +
-  card(s.accounts_skipped ?? "-", "accounts skipped") + card(s.nacls ?? "-", "NACLs checked") +
-  ["error","warn","info"].map(v => card(ALL.filter(f => f.severity === v).length, v + " findings")).join("");
-
-el("selects").innerHTML = FILTERS.map(k => {
-  const counts = {};
-  ALL.forEach(f => { if (f[k]) counts[f[k]] = (counts[f[k]] || 0) + 1; });
-  const keys = Object.keys(counts).sort((a, b) => k === "severity" ? SEV[a] - SEV[b] : a.localeCompare(b, undefined, {numeric:true}));
-  return `<label>${LABEL[k]}<select data-k="${k}"><option value="">All (${keys.length})</option>` +
-    keys.map(v => `<option value="${esc(v)}">${esc(v)} (${counts[v]})</option>`).join("") + `</select></label>`;
-}).join("");
-
-function rows() {
-  const q = st.q.toLowerCase();
-  return ALL.filter(f => (st.info || f.severity !== "info" || st.f.severity === "info")
-    && Object.entries(st.f).every(([k, v]) => !v || f[k] === v)
-    && (!q || COLS.some(([k]) => String(f[k] ?? "").toLowerCase().includes(q))));
-}
-function cmp(a, b) {
-  for (const [k, d] of st.sort) {
-    const x = k === "severity" ? SEV[a[k]] : a[k] ?? "", y = k === "severity" ? SEV[b[k]] : b[k] ?? "";
-    const c = typeof x === "number" ? x - y : String(x).localeCompare(String(y), undefined, {numeric:true});
-    if (c) return c * d;
-  }
-  return 0;
-}
-function uniq(rs, k) {
-  const set = new Set();
-  rs.forEach(f => k === "subnet" ? (f.subnets ? f.subnets.split(", ") : []).forEach(x => set.add(x))
-                                  : f[k] && set.add(f[k]));
-  return set.size;
-}
-function saveHash() {
-  const p = new URLSearchParams();
-  Object.entries(st.f).forEach(([k, v]) => v && p.set(k, v));
-  if (st.q) p.set("q", st.q);
-  if (st.info) p.set("info", "1");
-  p.set("sort", st.sort.map(([k, d]) => (d < 0 ? "-" : "") + k).join(","));
-  history.replaceState(null, "", "#" + p.toString());
-}
-function loadHash() {
-  const p = new URLSearchParams(location.hash.slice(1));
-  FILTERS.forEach(k => { if (p.get(k)) st.f[k] = p.get(k); });
-  st.q = p.get("q") || "";
-  st.info = p.get("info") === "1";
-  if (p.get("sort")) st.sort = p.get("sort").split(",").filter(x => LABEL[x.replace(/^-/, "")])
-    .map(x => x.startsWith("-") ? [x.slice(1), -1] : [x, 1]);
-  if (!st.sort.length) st.sort = [["severity", 1]];
-  el("q").value = st.q; el("info").checked = st.info;
-  document.querySelectorAll("select[data-k]").forEach(x => x.value = st.f[x.dataset.k] || "");
-}
-function render() {
-  saveHash();
-  const rs = rows().sort(cmp);
-  el("shown").textContent = `(${rs.length} of ${ALL.length})`;
-  el("uniq").innerHTML = card(rs.length, "findings") + UNIQ.map(([k, l]) => card(uniq(rs, k), l)).join("");
-  const by = {};
-  rs.forEach(f => (by[f.code] = by[f.code] || {sev: f.severity, rs: []}).rs.push(f));
-  el("bycode").innerHTML = `<tr><th>Code</th><th>Severity</th><th>Findings</th>` +
-    UNIQ.filter(([k]) => k !== "code").map(([, l]) => `<th>${l}</th>`).join("") + `</tr>` +
-    Object.entries(by).sort((a, b) => SEV[a[1].sev] - SEV[b[1].sev] || b[1].rs.length - a[1].rs.length)
-      .map(([c, v]) => `<tr><td class="mono f" data-k="code" data-v="${esc(c)}">${esc(c)}</td>` +
-        `<td><span class="badge ${v.sev}">${v.sev}</span></td><td>${v.rs.length}</td>` +
-        UNIQ.filter(([k]) => k !== "code").map(([k]) => `<td>${uniq(v.rs, k)}</td>`).join("") + `</tr>`).join("");
-  const sorted = Object.fromEntries(st.sort.map(([k, d]) => [k, d]));
-  el("tbl").innerHTML = `<tr>` + COLS.map(([k, l]) =>
-      `<th data-s="${k}" class="${k in sorted ? "sorted" + (sorted[k] < 0 ? " desc" : "") : ""}">${l}</th>`).join("") + `</tr>` +
-    rs.map(f => `<tr>` + COLS.map(([k]) => {
-      const v = f[k] ?? "", fl = FILTERS.includes(k) && v ? ` f" data-k="${k}" data-v="${esc(v)}` : "";
-      if (k === "severity") return `<td class="${fl.trim() ? "f" : ""}" data-k="${k}" data-v="${esc(v)}"><span class="badge ${esc(v)}">${esc(v)}</span></td>`;
-      return `<td class="mono${WRAP.includes(k) ? "" : " nw"}${fl}">${esc(v)}</td>`;
-    }).join("") + `</tr>`).join("");
-}
-function setFilter(k, v) {
-  st.f[k] = v;
-  const sel = document.querySelector(`select[data-k="${k}"]`);
-  if (sel) sel.value = v;
-  render();
-}
-document.addEventListener("change", e => { if (e.target.dataset.k) setFilter(e.target.dataset.k, e.target.value); });
-el("q").addEventListener("input", e => { st.q = e.target.value; render(); });
-el("info").addEventListener("change", e => { st.info = e.target.checked; render(); });
-el("reset").addEventListener("click", () => {
-  st.q = ""; st.f = {}; st.info = false; st.sort = [["severity", 1]];
-  el("q").value = ""; el("info").checked = false;
-  document.querySelectorAll("select[data-k]").forEach(x => x.value = "");
-  render();
-});
-document.addEventListener("click", e => {
-  const th = e.target.closest("th[data-s]");
-  if (th) {
-    const k = th.dataset.s, i = st.sort.findIndex(([x]) => x === k);
-    if (e.shiftKey) { i >= 0 ? st.sort[i][1] *= -1 : st.sort.push([k, 1]); }
-    else st.sort = [[k, i === 0 ? -st.sort[0][1] : 1]];
-    return render();
-  }
-  const td = e.target.closest("td.f");
-  if (td && td.dataset.k) setFilter(td.dataset.k, td.dataset.v);
-});
-el("csv").addEventListener("click", () => {
-  const q = v => /[",\\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
-  const lines = [COLS.map(([k]) => k).join(",")].concat(
-    rows().sort(cmp).map(f => COLS.map(([k]) => q(String(f[k] ?? ""))).join(",")));
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([lines.join("\\n")], {type: "text/csv"}));
-  a.download = "nacl_drift_filtered.csv";
-  a.click();
-});
-loadHash();
-render();
-})();
-</script></body></html>
-"""
-
-
 def render_html(findings: list[Finding], stats: dict, policy: str = "") -> str:
-    data = {"generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "policy": policy, "stats": stats,
-            "findings": [asdict(f) for f in findings]}
-    # Inside <script type=application/json>, only "</" can end the element early.
-    return HTML_TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
+    """Build the interactive HTML report: run totals and a filterable, sortable findings table
+    with unique counts of accounts, VPCs, NACLs and subnets.
+    """
+    sev = [f.severity for f in findings]
+    cards = [(stats.get("policies", "-"), "policies"), (stats.get("accounts", "-"), "accounts scanned"),
+             (stats.get("accounts_skipped", "-"), "accounts skipped"), (stats.get("nacls", "-"), "NACLs checked")]
+    cards += [(sev.count(s), f"{s} findings") for s in ("error", "warn", "info")]
+    meta = [f"Generated {dt.datetime.now():%Y-%m-%d %H:%M:%S}" + (f" · policy {policy}" if policy else "")]
+    table = {
+        "id": "findings", "title": "Findings", "row_label": "findings",
+        "columns": [["severity", "Severity"], ["code", "Code"], ["region", "Region"], ["policy_name", "Policy"],
+                    ["account", "Account"], ["profile", "Profile"], ["vpc_id", "VPC"], ["nacl_id", "NACL"],
+                    ["subnets", "Subnets"], ["baseline", "Baseline"], ["direction", "Direction"],
+                    ["position", "Position"], ["expected", "Expected"], ["actual", "Actual"], ["detail", "Detail"]],
+        "rows": [asdict(f) for f in findings],
+        "filters": ["severity", "code", "region", "policy_name", "account", "vpc_id", "nacl_id", "direction",
+                    "baseline"],
+        "uniq": [["account", "Accounts"], ["region", "Regions"], ["policy_name", "Policies"], ["vpc_id", "VPCs"],
+                 ["nacl_id", "NACLs"], ["subnets", "Subnets"], ["code", "Finding codes"]],
+        "wrap": ["subnets", "expected", "actual", "detail"],
+        "badges": {"severity": {"error": "error", "warn": "warn", "info": "info"}},
+        "order": {"severity": list(SEVERITY_ORDER)},
+        "sort": [["severity", 1]],
+        "hide": {"key": "severity", "values": ["info"], "label": "show info"},
+        "by": {"key": "code", "label": "By code", "badge": "severity"},
+    }
+    return html_report.render("NACL audit report", meta=meta, cards=cards, tables=[table])
 
 
 def write_outputs(findings: list[Finding], stats: dict, json_path, csv_path, html_path=None, policy: str = "") -> None:
+    """Write the JSON, CSV and HTML reports to whichever paths are set."""
     for path in (json_path, csv_path, html_path):
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -904,6 +791,7 @@ def write_outputs(findings: list[Finding], stats: dict, json_path, csv_path, htm
 # CLI
 # --------------------------------------------------------------------------- #
 def main() -> int:
+    """Command-line entry point. Returns 0 clean, 1 error/warn findings, 2 fatal."""
     p = argparse.ArgumentParser(
         description="Compare live network ACLs in FMS member accounts against a Firewall Manager NACL policy.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -976,7 +864,7 @@ def main() -> int:
     if not args.no_save:
         now = dt.datetime.now()
         slug = re.sub(r"[^A-Za-z0-9._-]+", "_", args.policy or Path(args.policy_file or "all").stem)[:48]
-        stem = Path(args.out_dir) / now.strftime("%Y-%m-%d") / f"{now.strftime('%H%M%S')}_nacl_{slug}"
+        stem = Path(args.out_dir) / "fmm_nacl_audit" / now.strftime("%Y-%m-%d") / f"{now.strftime('%H%M%S')}_nacl_{slug}"
         paths = {"json": f"{stem}.json", "csv": f"{stem}.csv", "html": f"{stem}.html"}
     json_path = args.json_out or paths.get("json")
     csv_path = args.csv_out or paths.get("csv")

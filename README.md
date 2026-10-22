@@ -1,434 +1,435 @@
-# fmm_parity — AWS Firewall Manager rule parity review
+# aws-firewall-tools
 
-Walks every AWS Firewall Manager (FMS) policy in one or more regions, expands
-the rules those policies carry, and reports every rule where any **A target**
-(IP + protocol + port, or a managed prefix list) is present but the expected
-**B target(s)** are missing alongside it. Read-only; no mutating API calls.
+Read-only review tools for AWS Firewall Manager (FMS) policies, network ACLs
+and security groups. None of them make changes in AWS.
 
-Rule sources inspected per policy type:
-
-| FMS policy type | Rules read from |
+| Tool | Question it answers |
 |---|---|
-| `SECURITY_GROUPS_COMMON`, `SECURITY_GROUPS_CONTENT_AUDIT` | Referenced security groups (`ec2:DescribeSecurityGroups`) — ingress + egress CIDR rules; managed prefix list references expanded to CIDRs |
-| `NETWORK_FIREWALL` | Referenced stateless and stateful rule groups (`network-firewall:DescribeRuleGroup`) — 5-tuple rules and Suricata rule strings (header portion), with `$IPSET` / `$PORTSET` variables and `ReferenceSets` prefix-list IP set references resolved |
-| `NETWORK_ACL_COMMON` | Inline `networkAclEntrySet.firstEntries` / `lastEntries` |
-| WAF, WAFV2, Shield, DNS Firewall, third-party | Skipped (no IP+port rule semantics) |
+| [`fmm_rule_parity.py`](#fmm_rule_parity) | Which FMS policy rules allow target A without a matching rule for target B? |
+| [`fmm_nacl_audit.py`](#fmm_nacl_audit) | Do the live NACLs in FMS member accounts carry the policy's first/last rules, and are any near the rule limit? |
+| [`sg_access_gap.py`](#sg_access_gap) | What access does one security group grant that one or more others, combined, do not? |
 
-## Usage
+**Contents:** [Getting started](#getting-started) ·
+[Configuration](#configuration) · [Reports](#reports) ·
+[fmm_rule_parity](#fmm_rule_parity) · [fmm_nacl_audit](#fmm_nacl_audit) ·
+[sg_access_gap](#sg_access_gap) · [Repository layout](#repository-layout)
+
+---
+
+## Getting started
+
+Requires Python 3.11+ and AWS credentials (local AWS profiles).
 
 ```bash
-python fmm_parity.py --profile fms-admin --region ca-central-1,us-east-1 \
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env        # optional defaults, see Configuration
+```
+
+The tools are executable:
+
+```bash
+./fmm_rule_parity.py --help
+./fmm_nacl_audit.py --help
+./sg_access_gap.py --help
+```
+
+`python <tool>.py ...` works too. TLS uses the operating system's trust store
+(`truststore`): Security.framework on macOS, the Certificate Store on Windows,
+the system CA bundle on Linux (install `ca-certificates`).
+
+## Configuration
+
+Settings come from `.env` (see `.env.example`); command-line flags override them.
+
+| Variable | Used by | Meaning |
+|---|---|---|
+| `AWS_PROFILE` | all | Default AWS profile (`--profile` overrides) |
+| `AWS_REGION` | all | Default region (`--region` overrides) |
+| `FMM_REPORT_DIR` | all | Base directory for saved reports (default `./reports`) |
+| `FMM_ADMIN_ACCOUNT` | `fmm_nacl_audit` | FMS administrator (security) account id; its profile is found by account id |
+| `FMM_NACL_LIMIT` | `fmm_nacl_audit` | NACL rules-per-direction limit (default 30) |
+| `FMM_NACL_HEADROOM` | `fmm_nacl_audit` | Flag NACLs within this many rules of the limit (default 3) |
+
+## Reports
+
+Each run prints a text report and saves files under
+`reports/<tool>/YYYY-MM-DD/`. The saved paths are printed at the end of the
+text report, and `reports/` is gitignored.
+
+```
+reports/
+├── fmm_rule_parity/2026-10-22/
+│   ├── 224850_parity_10.0.0.1_32_tcp_8080_vs_pl-0cb0138_tcp_8080.html
+│   ├── 224850_parity_10.0.0.1_32_tcp_8080_vs_pl-0cb0138_tcp_8080.compliance.csv
+│   ├── 224850_parity_10.0.0.1_32_tcp_8080_vs_pl-0cb0138_tcp_8080.gaps.csv
+│   └── 224850_parity_10.0.0.1_32_tcp_8080_vs_pl-0cb0138_tcp_8080.json
+├── fmm_nacl_audit/2026-10-22/
+│   └── 230112_nacl_<policy>.{html,csv,json}
+└── sg_access_gap/2026-10-22/
+    └── 231540_sggap_<group ids>.{html,csv,json}
+```
+
+Common output flags:
+
+| Flag | Effect |
+|---|---|
+| `--out-dir DIR` | Base directory instead of `./reports` (env `FMM_REPORT_DIR`) |
+| `--no-save` | Don't save files |
+| `--html-out` / `--csv-out` / `--json-out PATH` | Write that file to a specific path |
+| `--json` | Print JSON instead of the text report |
+| `-v` / `-q` | Debug / warnings-only logging |
+
+**HTML reports** are single self-contained files (data embedded, no external
+assets, light/dark aware), safe to attach or email.
+
+- The `fmm_rule_parity` and `fmm_nacl_audit` reports are interactive:
+  - free-text search, filter dropdowns that show counts, and click-a-cell filtering
+  - unique counts (accounts, regions, policies, VPCs, NACLs, containers ...) for the current filter
+  - multi-column sort (shift-click a header)
+  - "Download filtered CSV"
+  - the current view is kept in the URL fragment, so it can be bookmarked
+- The `sg_access_gap` report is a static page laid out per direction.
+
+**Exit codes** (all tools): `0` nothing found, `1` findings (gaps, errors or
+warnings), `2` fatal error (bad input, wrong account, AWS failure).
+
+---
+
+## fmm_rule_parity
+
+Walks every FMS policy in one or more regions, expands the rules the policies
+carry, and reports each rule where any **A target** (IP + protocol + port, or a
+managed prefix list) is present but the expected **B target(s)** are not.
+
+Typical use: "every rule that allows the old load balancer IP should have a
+sibling rule for the new prefix list".
+
+### Usage
+
+```bash
+./fmm_rule_parity.py --profile fms-admin --region ca-central-1,us-east-1 \
     -a 10.0.0.1 tcp 8080 -a 10.0.0.2 tcp 8080 \
     -b pl-0123abcd tcp 8080 -b pl-0456ef01 tcp 8080 --b-match all
 ```
 
+More examples:
+
+```bash
+# Two regions, IP vs IP
+./fmm_rule_parity.py --profile fms-admin --region us-east-1 --region us-west-2 \
+    -a 10.0.0.1 tcp 8080 -b 192.168.1.1 tcp 8080
+
+# IP vs managed prefix list: rules allowing the IP with no sibling rule referencing the list
+./fmm_rule_parity.py --profile fms-admin -a 10.0.0.1 tcp 8080 -b pl-0123456789abcdef0 tcp 8080
+
+# Any protocol/port, parity anywhere in the same policy, JSON to stdout
+./fmm_rule_parity.py --profile fms-admin -a 10.0.0.0/24 any any -b 192.168.1.0/24 any any \
+    --scope policy --json > report.json
+
+# One policy, also list every rule touching either target
+./fmm_rule_parity.py --profile fms-admin --policy prod-baseline-sg \
+    -a 10.0.0.1 tcp 8080 -b 192.168.1.1 tcp 8080 --show-all
+```
+
+### Targets
+
+A target is `IP[/prefix] PROTO PORT` or `pl-xxxx PROTO PORT`:
+
+- **IP**: a CIDR, or a managed prefix list id / ARN (matched by reference by default; see `--pl-match`).
+- **PROTO**: `tcp`, `udp`, `icmp`, `any`, or an IP protocol number.
+- **PORT**: single (`8080`), range (`8000-8100`), or `any`.
+
+Omitted `PROTO` / `PORT` default to `any`. Tokens may be space- or
+comma-separated or quoted as one string, and filler words are ignored
+(`-a 10.0.0.1 tcp port 8080` works).
+
 `-a` and `-b` are repeatable. A rule is "A-present" when **any** `-a` target
-matches it. B is satisfied when **any** `-b` target has a counterpart (default)
-or **all** of them do (`--b-match all`). Targets are labelled `A1, A2, …` and
-`B1, B2, …` in output.
+matches it. B is satisfied when **any** `-b` target has a counterpart (the
+default) or when **all** do (`--b-match all`). Targets are labelled `A1, A2, …`
+and `B1, B2, …` in output.
 
-Targets are `IP[/prefix] PROTO PORT` or `pl-xxxx PROTO PORT`:
+### Rules inspected
 
-- `IP`: a CIDR, **or** a managed prefix list ID / ARN (case-insensitive). A prefix
-  list target matches rules that reference that prefix list (see `--pl-match`)
-- `PROTO`: `tcp`, `udp`, `icmp`, `any`, or an IP protocol number
-- `PORT`: single (`8080`), range (`8000-8100`), or `any`
+| FMS policy type | Rules read from |
+|---|---|
+| `SECURITY_GROUPS_COMMON`, `SECURITY_GROUPS_CONTENT_AUDIT` | Referenced security groups: ingress and egress CIDR rules, with prefix list references expanded |
+| `NETWORK_FIREWALL` | Referenced stateless and stateful rule groups: 5-tuple rules and Suricata rule headers, with `$IPSET` / `$PORTSET` variables and `ReferenceSets` prefix lists resolved |
+| `NETWORK_ACL_COMMON` | Inline `networkAclEntrySet.firstEntries` / `lastEntries` |
+| WAF, WAFV2, Shield, DNS Firewall, third-party | Skipped (no IP + port rules) |
 
-Tokens may be space- or comma-separated, quoted as one string, and filler words
-like `port` are ignored (`-a 10.0.0.1 tcp port 8080` works). Omitted `PROTO` /
-`PORT` default to `any`.
+### How matching works
 
-Exit code is `1` when any gap is found, `0` otherwise (handy for CI).
+A rule **matches** a target when all of these hold:
+
+1. **Protocol** is compatible: equal, or either side is `any`.
+2. **Port**: if both the target and the rule specify ports, the target port falls inside one of the rule's source or destination port ranges. Port-agnostic rules match any port.
+3. **Address**:
+   - *CIDR target*: contained in one of the rule's explicit source or destination networks. A rule with no address constraint on either side matches as `any`.
+   - *Prefix list target, `--pl-match ref` (default)*: the rule references that prefix list (security group `PrefixListIds`, or a Network Firewall `ReferenceSets` variable). Wide CIDR rules such as `0.0.0.0/0` do **not** count.
+   - *Prefix list target, `cidrs-all` / `cidrs-any`*: the list is expanded and the rule's CIDRs must cover all / any of its entries.
+
+The role the target matched in (`src`, `dst`) is recorded.
+
+A **gap** is a rule that matches an A target in some role while the same
+scope (container by default, or policy with `--scope policy`) has no rule of
+the same shape (kind, direction, action, protocol) matching the B target(s) in
+that role. A single wide rule covering both targets counts as parity.
+
+Prefix lists:
+- Customer- and AWS-managed prefix lists are expanded with `ec2:GetManagedPrefixListEntries` and cached.
+- Prefix lists are regional, so a `cidrs-*` target is resolved in every scanned region and the CIDRs combined.
+
+References that can't be evaluated are listed on the finding but not
+evaluated: prefix lists the account can't read, SG-to-SG references, and
+negated or unknown Suricata variables.
 
 ### Options
 
 | Flag | Description |
 |---|---|
-| `--target-a IP PROTO PORT` / `-a` | Target that must be present (repeatable, any may match) |
-| `--target-b IP PROTO PORT` / `-b` | Target expected alongside A (repeatable) |
-| `--b-match any\|all` | With several `-b`: parity needs any one (default) or all of them |
-| `--pl-match ref\|cidrs-all\|cidrs-any` | Prefix-list target semantics: `ref` (default) = rule must reference the prefix list ID; `cidrs-all` / `cidrs-any` = expand the list and require rule CIDRs to cover all / any entry |
-| `--profile NAME` | AWS profile (overrides `AWS_PROFILE`) |
-| `--region REGION` | Region(s) to scan; repeatable and/or comma-separated. Default `AWS_REGION` or `us-east-1` |
-| `--all-regions` | Scan every enabled region that offers Firewall Manager |
-| `--policy ID_OR_NAME` | Restrict to one policy |
-| `--scope container\|policy` | Where B must exist: same SG / rule group / NACL entry list (default) or anywhere in the same policy |
-| `--show-all` | Also list every rule matching A or B, tagged `[AB]`, `[A-]`, `[-B]` |
-| `--json` | JSON to stdout instead of text report |
-| `--json-out PATH` | Write JSON report to file |
-| `--out-dir DIR` | Base directory for auto-saved reports (default `./reports`, env `FMM_REPORT_DIR`) |
-| `--no-save` | Skip auto-saving |
-| `--report-out PATH` | Per-container compliance CSV path (overrides auto path) |
-| `--all-containers` | Show rule groups and NACL lists in the on-screen compliance table (default: SGs only) |
-| `--csv-out PATH` | Write CSV to file: one row per gap; with `--show-all`, every rule matching A or B |
-| `-v` / `-q` | Debug / warnings-only logging |
+| `-a`, `--target-a IP PROTO PORT` | Target that must be present (repeatable; any may match) |
+| `-b`, `--target-b IP PROTO PORT` | Target expected alongside A (repeatable) |
+| `--b-match any\|all` | With several `-b`: parity needs any one (default) or all |
+| `--pl-match ref\|cidrs-all\|cidrs-any` | How a prefix list target matches (see above) |
+| `--profile NAME` | AWS profile (FMS administrator account) |
+| `--region REGION` | Region(s): repeatable and/or comma-separated (default `AWS_REGION` or `us-east-1`) |
+| `--all-regions` | Every enabled region that offers Firewall Manager |
+| `--policy ID_OR_NAME` | Only this policy |
+| `--scope container\|policy` | Where B must exist: same SG / rule group / NACL list (default) or anywhere in the policy |
+| `--show-all` | Also list every rule matching A or B (text, gaps CSV, JSON) |
+| `--all-containers` | Include rule groups and NACL lists in the on-screen compliance table (default: SGs only) |
+| `--report-out PATH` | Compliance CSV path |
+| `--csv-out PATH` | Gaps CSV path |
 
-### Examples
+Plus the [common output flags](#reports).
 
-```bash
-# Multi-region, named profile
-python fmm_parity.py --profile fms-admin --region us-east-1 --region us-west-2 \
-    -a 10.0.0.1 tcp 8080 -b 192.168.1.1 tcp 8080
+### Output
 
-# A is an IP, B is a managed prefix list: find rules allowing the IP with no
-# sibling rule referencing the prefix list
-python fmm_parity.py --profile fms-admin -a 10.0.0.1 tcp 8080 -b pl-0123456789abcdef0 tcp 8080
+- **Text**: summary (rules inspected, A matches, B matches, gaps), then each gap grouped by region / policy / container with the raw rule and the reason, then a compliance table per security group.
+- **Compliance CSV** (`.compliance.csv`): one row per container with its status, below. A security group used by several policies appears once, listing every policy.
+  | Status | Meaning |
+  |---|---|
+  | `NON_COMPLIANT` | At least one rule matches A with no B counterpart |
+  | `COMPLIANT` | A is present and every A rule has its B counterpart |
+  | `NOT_APPLICABLE` | No A target in this container |
+- **Gaps CSV** (`.gaps.csv`): one row per gap (plus every A/B match with `--show-all`). Columns: `gap, matches_a, a_targets, matches_b, b_targets, region, policy_name, policy_id, policy_type, container, container_name, kind, direction, action, proto, src_nets, dst_nets, src_ports, dst_ports, src_pls, dst_pls, raw, reason, unresolved`. `a_targets` / `b_targets` show which target matched in which role (e.g. `A1:src;A2:src`); multi-valued cells are `;`-separated and `any` means unconstrained.
+- **JSON**: `{targets_a, targets_b, b_mode, scope, regions, stats, findings, containers}` plus `matching_rules` with `--show-all`.
+- **HTML**: two interactive tables.
+  - *Compliance by container*: every container type. `NOT_APPLICABLE` rows are hidden until ticked.
+  - *Rules matching A or B*: `GAP` marks A rules without a B counterpart. Rules without a gap are hidden until ticked.
 
-# Any protocol/port, loosen parity to policy level, JSON out
-python fmm_parity.py --profile fms-admin -a 10.0.0.0/24 any any -b 192.168.1.0/24 any any \
-    --scope policy --json > report.json
+### IAM permissions
 
-# Text report on screen, plus JSON + CSV files
-python fmm_parity.py --profile fms-admin -a 10.0.0.1 tcp 8080 -b 192.168.1.1 tcp 8080 \
-    --show-all --json-out report.json --csv-out report.csv
-
-# One policy, show everything touching either target
-python fmm_parity.py --profile fms-admin --policy prod-baseline-sg \
-    -a 10.0.0.1 tcp 8080 -b 192.168.1.1 tcp 8080 --show-all
-```
-
-## How matching works
-
-A rule *matches* a target when:
-
-1. Protocol is compatible (rule `any` or equal to target's; target `any` matches all).
-2. If the target has a port and the rule constrains ports, the port falls inside one of the rule's defined source or destination port ranges. Port-agnostic rules match any port.
-3. Address match, by target kind:
-   - **CIDR target**: contained in one of the rule's explicitly defined source or destination networks. A rule with no address constraints on either side matches as `any`.
-   - **Prefix list target** (`--pl-match ref`, default): the rule references that prefix list ID, either as a security group `PrefixListIds` entry or as a Network Firewall `ReferenceSets` IP set variable. Wide CIDR rules such as `0.0.0.0/0` do **not** count.
-   - **Prefix list target** (`cidrs-all` / `cidrs-any`): the list is expanded and the rule's CIDRs must cover all / any of its entries.
-
-   The role (`src`, `dst`) is recorded.
-
-A **gap** is reported when a rule matches any A target in some role, and the
-same scope lacks same-*shape* rules (`kind`, direction, action, protocol)
-matching the B target(s) in that role: any one B target by default, every B
-target with `--b-match all`. A single wide rule (e.g. `0.0.0.0/0`) that
-covers both targets counts as parity.
-
-Managed prefix lists (customer- and AWS-managed) are expanded via
-`ec2:GetManagedPrefixListEntries` and cached per list. Prefix lists are
-regional, so a prefix-list target in `cidrs-*` mode is resolved in every
-scanned region and the CIDRs unioned. A security group rule
-referencing a prefix list becomes one rule carrying all of that list's CIDRs.
-Unresolvable references (prefix lists the admin account cannot read, SG-to-SG
-references, negated or unknown Suricata variables) are listed per finding but
-not evaluated.
-
-## Requirements
-
-- Python 3.11+
-- AWS credentials for the Firewall Manager administrator account
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env   # optional: AWS_PROFILE / AWS_REGION defaults
-```
-
-## Platform Notes
-
-- **macOS**: System PKI truststore used automatically via Security.framework.
-- **Windows**: System Certificate Store used automatically. Credentials at `%USERPROFILE%\.aws\credentials`.
-- **Linux**: System CA bundle used via `truststore`. Ensure `ca-certificates` is installed.
-
-## IAM Permissions
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "fms:ListPolicies",
-        "fms:GetPolicy",
-        "ec2:DescribeSecurityGroups",
-        "ec2:DescribeRegions",
-        "ec2:GetManagedPrefixListEntries",
-        "network-firewall:DescribeRuleGroup"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-## Saved reports
-
-Every run saves three files by default, organised by date:
-
-```
-reports/
-└── 2026-10-09/
-    ├── 224850_10.160.67.203_32_tcp_8080_vs_pl-0cb0138_tcp_8080.compliance.csv
-    ├── 224850_10.160.67.203_32_tcp_8080_vs_pl-0cb0138_tcp_8080.gaps.csv
-    └── 224850_10.160.67.203_32_tcp_8080_vs_pl-0cb0138_tcp_8080.json
-```
-
-Filename = `HHMMSS_<targetA>_vs_<targetB>`. Change the base directory with
-`--out-dir` or `FMM_REPORT_DIR`; override any single file with `--report-out`,
-`--csv-out`, `--json-out`; disable with `--no-save`. Saved paths are printed at
-the end of the text report. `reports/` is gitignored.
-
-## Compliance report
-
-After the gap list, a per-security-group table is printed (add
-`--all-containers` for Network Firewall rule groups and NACL entry lists).
-`--report-out report.csv` writes the same data; `containers[]` carries it in
-JSON output.
-
-| Status | Meaning |
-|---|---|
-| `NON_COMPLIANT` | At least one rule matches A with no B counterpart |
-| `COMPLIANT` | A present, and every A rule has a B counterpart |
-| `NOT_APPLICABLE` | A not present in this container |
-
-Columns: `status, region, container_type, container, container_name, policies,
-rules_total, rules_matching_a, rules_matching_b, a_targets_seen, b_targets_seen,
-gaps, gap_rules`. A security
-group referenced by several policies appears once, with all policy names.
-Security groups with no rules at all emit no rows.
-
-## Output
-
-Text mode prints a summary line (rules inspected, A matches, B matches, gaps),
-then each gap grouped by region / policy / container with the raw rule and the
-reason. `--json` / `--json-out` emit `{targets_a[], targets_b[], b_mode, regions[], scope, stats, findings[], containers[]}`
-and, with `--show-all`, `matching_rules[]`.
-
-`--csv-out` columns: `gap, matches_a, a_targets, matches_b, b_targets, region,
-policy_name, policy_id, policy_type, container, container_name, kind, direction,
-action, proto, src_nets, dst_nets, src_ports, dst_ports, src_pls, dst_pls, raw,
-reason, unresolved`. `a_targets`/`b_targets` list which labelled targets hit
-and in which role, e.g. `A1:src;A2:src`. Multi-valued cells are
-`;`-separated; `any` means unconstrained. `matches_a`/`matches_b` hold the
-role(s) (`src`, `dst`, `any`) or blank for no match. Without `--show-all` only
-`gap=True` rows are written.
+`fms:ListPolicies`, `fms:GetPolicy`, `ec2:DescribeSecurityGroups`,
+`ec2:DescribeRegions`, `ec2:GetManagedPrefixListEntries`,
+`network-firewall:DescribeRuleGroup`.
 
 ---
 
-# fmm_nacl_drift — live NACLs vs Firewall Manager NACL policy
+## fmm_nacl_audit
 
-Companion to `fmm_parity.py`. For each `NETWORK_ACL_COMMON` policy it asks FMS
-which member accounts are in scope (`fms:ListComplianceStatus`), reads the live
-network ACLs in each account through a **local AWS profile** for that account,
-and reports:
+Checks the live network ACLs in FMS member accounts against Firewall Manager
+`NETWORK_ACL_COMMON` policies.
 
-- **First / last rule drift** — per direction, the lowest-numbered live entries
-  must equal the policy's `FirstEntries` and the highest-numbered (below the
-  `*` default) must equal `LastEntries`, in order. Compared fields: action,
-  protocol, CIDR, port range, ICMP type/code.
-- **Duplicate rules** — the same action / protocol / CIDR / ports / ICMP at
-  more than one rule number in a direction (`DUPLICATE_RULE`). Only the
-  lowest-numbered copy is ever evaluated; the rest waste slots against the limit.
-- **Default NACLs** — VPC default NACLs are never checked against the policy
-  (even with `--nacl-scope all`). Every default NACL in each scanned account
-  and region must hold only the `*` deny-all rules; anything else is
-  `DEFAULT_NACL_NOT_DENY_ALL`. The finding's `subnets` shows any subnets still
-  attached to it.
-- **Rule-count limit** — NACLs with `>= --limit` rules in a direction
-  (default 30, our raised quota; AWS default is 20), or within `--headroom` of it
-  (default 3, so 27+ rules is flagged). FMS
-  remediation temporarily adds rules, so headroom matters.
+How a run works:
+1. Asks FMS which member accounts are in scope for each policy (`fms:ListComplianceStatus`).
+2. Picks a local AWS profile for each of those accounts.
+3. Finds the subnets that match the policy's tag scope, and the NACLs attached to them.
+4. Checks each of those NACLs.
 
-Read-only. No mutating API calls.
+### What it checks
 
-## Usage
+- **First / last rules.** Per direction, the lowest-numbered live entries must equal the policy's `FirstEntries`, and the highest-numbered entries below the `*` default must equal its `LastEntries`, in order. Compared: action, protocol, CIDR, port range, ICMP type/code.
+- **Rule-count limit.** A direction with `--limit` rules or more is flagged; so is one within `--headroom` of it. The defaults are 30, the raised quota (AWS default is 20), and 3, so 27+ rules is flagged. FMS remediation temporarily adds rules, so headroom matters.
+- **Duplicate rules.** The same action, protocol, CIDR, ports and ICMP at more than one rule number in a direction. Only the lowest-numbered copy is ever evaluated; the rest waste slots.
+- **Default NACLs.** VPC default NACLs are never checked against the policy, even with `--nacl-scope all`. They must hold only the `*` deny-all rules. The finding lists any subnets still attached.
+- **Tagging.** In-scope NACLs should be tagged `FMManaged=true`.
+
+### Usage
 
 ```bash
-# All NACL policies in a region, expected rules from the live FMS policy
-python fmm_nacl_drift.py --profile fms-admin --region us-east-1
+# All NACL policies in a region; expected rules from the live FMS policy
+./fmm_nacl_audit.py --profile fms-admin --region us-east-1
 
-# Expected rules from a policy file; accounts still come from FMS
+# Expected rules from a policy file (accounts still come from FMS)
 aws fms get-policy --policy-id <id> --profile fms-admin > prod-nacl.json
-python fmm_nacl_drift.py --profile fms-admin --policy-file prod-nacl.json
+./fmm_nacl_audit.py --policy-file prod-nacl.json
 
-# Also diff the file against the live policy and check NACLs against both
-python fmm_nacl_drift.py --profile fms-admin --policy-file prod-nacl.json --compare-live
+# Also diff the file against the live policy, and check NACLs against both
+./fmm_nacl_audit.py --policy-file prod-nacl.json --compare-live
 
 # Flag only NACLs at the limit (no headroom)
-python fmm_nacl_drift.py --profile fms-admin --headroom 0
+./fmm_nacl_audit.py --headroom 0
 ```
 
-**Region.** FMS policies are regional; each policy's member accounts are
-scanned only in that policy's region. A policy file's `PolicyArn` sets the
-region (it wins over `--region`). Without one, the policy is looked up in every
-`--region` given (or `--all-regions`); not found, or found in more than one, is
-a fatal error. `--policy` that matches nothing in the scanned regions is also
-fatal rather than a clean pass.
+### Policies and regions
 
-A policy file may be `aws fms get-policy` output, the bare `Policy` object, or
-a bare `NetworkAclEntrySet`. Rules are read from
-`SecurityServicePolicyData.PolicyOption.NetworkAclCommonPolicy.NetworkAclEntrySet`
-(`FirstEntries` / `LastEntries`); a policy with neither is a fatal error. The
-policy is located in FMS by `--policy`, else the file's `PolicyId` /
-`PolicyName`. Tag scope (`ResourceTags`) comes from the file when present,
-else from the live policy.
+- FMS policies are regional. Each policy's member accounts are scanned only in that policy's region.
+- A policy file's `PolicyArn` sets the region and wins over `--region`.
+- Without a `PolicyArn`, the policy is looked up in every `--region` given (or `--all-regions`). The run stops if it's found in none or in more than one.
+- A `--policy` that matches nothing is a fatal error, not a clean pass.
+- A policy file may be any of:
+  - `aws fms get-policy` output
+  - the bare `Policy` object
+  - a bare `NetworkAclEntrySet`
+- Rules are read from `SecurityServicePolicyData.PolicyOption.NetworkAclCommonPolicy.NetworkAclEntrySet` (`FirstEntries` / `LastEntries`). A policy with neither is a fatal error.
+- The file's policy is located in FMS by `--policy`, else by its `PolicyId` / `PolicyName`.
+- Tag scope (`ResourceTags`) comes from the file when present, else from the live policy.
 
-## FMS administrator account
+### Accounts and profiles
 
-Set the security account where Firewall Manager lives in `.env`:
+**FMS administrator account:** set it in `.env` as
+`FMM_ADMIN_ACCOUNT=123456789012` (or pass `--admin-account`). Its profile is
+found by account id, like member accounts. Precedence: `--profile`, then
+`FMM_ADMIN_ACCOUNT` / `--admin-account`, then `AWS_PROFILE`.
 
-```bash
-FMM_ADMIN_ACCOUNT=123456789012
-```
+**Member accounts** are mapped to profiles from the local AWS config
+(`AWS_CONFIG_FILE` is honoured):
+- A profile's account is its `sso_account_id`, `aws_account_id`, or the account in its `role_arn`.
+- Profiles ending in `-priv` or `-cpar` are never used (`--exclude-profile-suffix` to change).
+- If several profiles match, the first alphabetically is used, with a warning. Force one with `--account-profile 123456789012=my-profile`.
+- Every profile is verified with `sts:GetCallerIdentity` before use. A mismatch is reported and the account is not scanned.
+- Accounts with no matching profile are reported as `NO_PROFILE`.
 
-(or `--admin-account`). Its profile is found by account id the same way as
-member accounts below and verified with `sts:GetCallerIdentity`. Precedence:
-`--profile` > `FMM_ADMIN_ACCOUNT` / `--admin-account` > `AWS_PROFILE`.
-
-## Account → profile mapping
-
-Profiles are read from the local AWS config (`AWS_CONFIG_FILE` honoured). A
-profile's account is its `sso_account_id`, `aws_account_id`, or the account
-in its `role_arn`. Profiles ending in `-priv` or `-cpar` are never used
-(`--exclude-profile-suffix` to change). When several profiles match, the first
-alphabetically is used with a warning; force one with
-`--account-profile 123456789012=my-profile`. Each profile is verified with
-`sts:GetCallerIdentity` before use; a mismatch is reported, not scanned.
-Accounts with no profile are reported as `NO_PROFILE`.
-
-## Options
+### Options
 
 | Flag | Description |
 |---|---|
-| `--admin-account ID` | FMS administrator (security) account; profile found by account id (env `FMM_ADMIN_ACCOUNT`) |
+| `--admin-account ID` | FMS administrator account (env `FMM_ADMIN_ACCOUNT`) |
 | `--profile NAME` | FMS administrator profile; overrides `--admin-account` |
-| `--region` / `--all-regions` | As in `fmm_parity.py` |
-| `--policy ID_OR_NAME` | Restrict to one policy (also locates a policy file's policy) |
+| `--region` / `--all-regions` | As for `fmm_rule_parity` |
+| `--policy ID_OR_NAME` | Only this policy (also locates a policy file's policy) |
 | `--policy-file PATH` | Expected rules from this file instead of the live policy |
-| `--compare-live` | With `--policy-file`: report file vs live policy diffs, check NACLs against both |
-| `--account ID` | Restrict to account(s); repeatable / comma-separated |
+| `--compare-live` | With `--policy-file`: diff file vs live policy and check NACLs against both |
+| `--account ID` | Only these account(s); repeatable / comma-separated |
 | `--account-profile ACCT=PROFILE` | Force the profile for an account (repeatable) |
 | `--exclude-profile-suffix LIST` | Profile suffixes never used (default `-priv,-cpar`) |
-| `--nacl-scope subnets\|fmmanaged\|all` | Non-default NACLs on subnets in the policy's tag scope (default), tagged `FMManaged=true`, or all non-default NACLs |
+| `--nacl-scope subnets\|fmmanaged\|all` | Check NACLs on subnets in the policy's tag scope (default), NACLs tagged `FMManaged=true`, or all non-default NACLs |
 | `--limit N` | Rules-per-direction limit (default 30, env `FMM_NACL_LIMIT`) |
 | `--headroom N` | Also flag NACLs within N rules of the limit (default 3, env `FMM_NACL_HEADROOM`) |
-| `--show-info` | Show info findings |
-| `--json`, `--json-out`, `--csv-out`, `--out-dir`, `--no-save` | As in `fmm_parity.py`; auto-saves `reports/YYYY-MM-DD/HHMMSS_nacl_<policy>.{html,json,csv}` |
-| `--html-out PATH` | Write the HTML report here (overrides auto path) |
+| `--show-info` | Show info findings in the text report |
 
-Exit code `1` on any error/warn finding, `2` on a fatal error, else `0`.
+Plus the [common output flags](#reports).
 
-## Findings
+### Findings
 
 | Code | Severity | Meaning |
 |---|---|---|
 | `FIRST_MISSING` / `LAST_MISSING` | error | Too few entries in that direction to hold the block |
-| `FIRST_MISMATCH` / `LAST_MISMATCH` | error | Entry in that position differs; field diffs listed |
-| `FIRST_OUT_OF_ORDER` / `LAST_OUT_OF_ORDER` | error | Expected entry exists, but at another rule number |
-| `AT_LIMIT` / `NEAR_LIMIT` | warn | Rule count at the limit / within headroom |
+| `FIRST_MISMATCH` / `LAST_MISMATCH` | error | The entry in that position differs (field differences listed) |
+| `FIRST_OUT_OF_ORDER` / `LAST_OUT_OF_ORDER` | error | The expected entry exists, but at another rule number |
 | `DEFAULT_NACL_NOT_DENY_ALL` | error | VPC default NACL has a rule other than `*` deny all |
-| `DUPLICATE_RULE` | warn | Identical rule at several rule numbers in one direction; `actual` gives the rule and its numbers |
-| `NOT_FMMANAGED` | warn | In-scope subnet's (non-default) NACL lacks `FMManaged=true` |
-| `POLICY_DRIFT` | warn/info | Policy file differs from live policy (`--compare-live`) |
 | `NO_PROFILE`, `PROFILE_ACCOUNT_MISMATCH`, `ACCOUNT_ERROR`, `FMS_ERROR` | error | Account or FMS could not be checked |
-| `FIRST_RENUMBERED` / `LAST_RENUMBERED` | info | Correct and in order, but not at FMS initial numbers (1.. / ..32766) |
-| `CUSTOM_OUTSIDE_RANGE` | info | Rule that matches no policy first/last rule (in any position) and is numbered outside the 5000–32000 custom range |
+| `AT_LIMIT` / `NEAR_LIMIT` | warn | Rule count at the limit / within headroom |
+| `DUPLICATE_RULE` | warn | Identical rule at several rule numbers; `actual` shows the rule and its numbers |
+| `NOT_FMMANAGED` | warn | In-scope NACL lacks `FMManaged=true` |
+| `POLICY_DRIFT` | warn / info | Policy file differs from the live policy (`--compare-live`) |
+| `FIRST_RENUMBERED` / `LAST_RENUMBERED` | info | Correct and in order, but not at FMS's initial numbers (1… / …32766) |
+| `CUSTOM_OUTSIDE_RANGE` | info | Rule matching no policy rule, numbered outside the 5000–32000 custom range |
 
-`baseline` on each finding is `file`, `live`, or `file-vs-live`.
+Each finding's `baseline` is `file`, `live` or `file-vs-live`.
 
-## HTML report
+### Output
 
-A single self-contained file (data embedded, no external assets, follows the
-system light/dark setting):
+- **Text**: findings grouped by region / policy / account / NACL; info findings only with `--show-info`.
+- **CSV / JSON**: every finding (`{stats, findings}` in JSON).
+- **HTML**: run totals, then one interactive findings table.
+  - Filters: severity, code, region, policy, account, VPC, NACL, direction, baseline.
+  - Unique counts of accounts, regions, policies, VPCs, NACLs and subnets, plus a per-code summary.
+  - Info findings are hidden until "show info" is ticked.
 
-- Run totals: policies, accounts scanned/skipped, NACLs checked, findings by severity.
-- Filters: free-text search plus dropdowns for severity, code, region, policy,
-  account, VPC, NACL, direction and baseline (each option shows its count).
-  Clicking a cell in one of those columns filters on it. Info findings are
-  hidden until "show info" is ticked.
-- Unique counts for the current filter: findings, accounts, regions, policies,
-  VPCs, NACLs, subnets, finding codes; and a per-code table with the same
-  unique counts.
-- Sortable findings table: click a header, shift-click for a secondary sort.
-- The filter and sort live in the URL fragment, so a filtered view can be
-  bookmarked or shared along with the file; "Download filtered CSV" exports
-  the rows currently shown.
+### IAM permissions
 
-## IAM permissions
-
-FMS admin profile: `sts:GetCallerIdentity`, `fms:ListPolicies`, `fms:GetPolicy`,
-`fms:ListComplianceStatus`, `ec2:DescribeRegions` (for `--all-regions`).
-Member-account profiles: `sts:GetCallerIdentity`,
-`ec2:DescribeNetworkAcls`, `ec2:DescribeSubnets`.
+- FMS admin profile: `sts:GetCallerIdentity`, `fms:ListPolicies`, `fms:GetPolicy`, `fms:ListComplianceStatus`, and `ec2:DescribeRegions` (for `--all-regions`).
+- Member-account profiles: `sts:GetCallerIdentity`, `ec2:DescribeNetworkAcls`, `ec2:DescribeSubnets`.
 
 ---
 
-# sg_diff
+## sg_access_gap
 
 Finds access granted by a **left** security group that the **right** security
 group(s) do not grant. With several right groups, the left group's access is
-checked against their combined access, as if they were all attached to the
-same ENI. A range split across two right groups therefore counts as granted.
-Access the right groups grant beyond the left is not reported. Ingress and
-egress are checked separately. Descriptions are shown for reference but never
-compared.
+checked against their **combined** access, as if all of them were attached to
+the same network interface. A range split across two right groups therefore
+counts as granted.
 
-## Usage
+- Access the right groups grant beyond the left is not reported.
+- Ingress and egress are checked separately.
+- Descriptions are shown for reference but never compared.
+
+### Usage
 
 ```bash
 # LEFT RIGHT [RIGHT ...]
-python sg_diff.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210
-python sg_diff.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210 sg-0aaaabbbbccccdddd
-python sg_diff.py --profile prod-admin \
-  arn:aws:ec2:us-east-1:111122223333:security-group/sg-0123456789abcdef0 \
-  arn:aws:ec2:us-east-1:111122223333:security-group/sg-0fedcba9876543210
+./sg_access_gap.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210
+./sg_access_gap.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210 sg-0aaaabbbbccccdddd
+./sg_access_gap.py --profile prod-admin \
+    arn:aws:ec2:us-east-1:111122223333:security-group/sg-0123456789abcdef0 \
+    arn:aws:ec2:us-east-1:111122223333:security-group/sg-0fedcba9876543210
 ```
 
-Groups may be ARNs or ids (mixed is fine). ARNs carry their region; bare ids
-use `--region`, then `AWS_REGION`, then the profile's region. All groups must
-be in one account: ARNs naming different accounts, a profile whose account
-(`sts:GetCallerIdentity`) differs from the ARNs, or groups with different
-owners stop the run (exit 2).
+Groups may be ARNs or ids, mixed.
+- ARNs carry their own region. Bare ids use `--region`, then `AWS_REGION`, then the profile's region.
+- All groups must be in one account. The run stops (exit 2) if the ARNs name different accounts, if the profile's account (`sts:GetCallerIdentity`) differs from the ARNs, or if the groups have different owners.
 
-## How rules are compared
+### How rules are compared
 
 Each rule becomes a set of boxes: protocol × port range (or ICMP type/code) ×
 address range. Prefix lists are expanded to their current entries. Each left
-rule is then checked against all rules of all right groups in the same
+rule is then checked against every rule of every right group in the same
 direction:
 
 | Code | Severity | Meaning |
 |---|---|---|
 | `MISSING` | error | Nothing in the right groups overlaps this left rule |
 | `PARTIAL` | error | The right groups grant only part of it |
-| `COVERED` | info | The right groups grant all of it through different rules (prefix list vs. its CIDRs, /16 vs. two /17s, a broader rule, pieces from several right groups) |
+| `PREFIX_LIST_UNRESOLVED` | warn | Prefix list entries couldn't be read; rules using it are compared by id only |
+| `COVERED` | info | The right groups grant all of it through different rules (a prefix list vs. its CIDRs, a /16 vs. two /17s, a broader rule, or pieces from several right groups) |
 | `IDENTICAL` | info | A right group has the same protocol, ports and peer |
-| `PREFIX_LIST_UNRESOLVED` | warn | Prefix list entries could not be read; rules using it are compared by id only |
 | `DIFFERENT_VPCS` | info | Groups are in different VPCs, so group references may not be comparable |
 
-For `MISSING` and `PARTIAL`, `uncovered` is the exact access that is absent
-(merged CIDRs, ports, ICMP types). Every finding lists the overlapping right
-rules (group, rule id, rule, description). `COVERED` and `IDENTICAL` are hidden
-unless `--show-covered`. Security group references match by group id; a left
-self-reference matches a self-reference in any right group. IPv4 and IPv6 are
-separate spaces.
+- For `MISSING` and `PARTIAL`, `uncovered` is the exact absent access (merged CIDRs, ports, ICMP types).
+- Every finding lists the overlapping right-group rules (group, rule id, rule, description).
+- Security group references match by group id. A left self-reference matches a self-reference in any right group.
+- IPv4 and IPv6 are compared separately.
 
 Each direction gets a verdict: `N gap(s)`, `covered` or `identical`.
 
-## Options
+### Options
 
-| Option | Description |
+| Flag | Description |
 |---|---|
 | `SG ...` | Group ARNs or ids: `LEFT RIGHT [RIGHT ...]` |
-| `--profile` | AWS profile (default `AWS_PROFILE`) |
-| `--region` | Region for bare ids |
-| `--show-covered` | Also list left rules fully granted by the right groups |
-| `--json` / `--json-out` / `--csv-out` | Output, as for the other tools |
-| `--html-out` | Write the HTML report here (overrides auto path) |
-| `--out-dir` / `--no-save` | Auto-saved reports under `reports/YYYY-MM-DD/HHMMSS_sgdiff_<ids>.{html,csv,json}` |
+| `--profile NAME` | AWS profile (default `AWS_PROFILE`) |
+| `--region REGION` | Region for bare group ids |
+| `--show-covered` | Also list left rules the right groups fully grant (`COVERED`, `IDENTICAL`) |
 
-The HTML report is a single self-contained file (no external assets, follows
-the system light/dark setting): finding counts, the groups, per-direction
-verdicts, a gaps table per direction with the absent access and overlapping
-right rules (fully granted left rules collapsed), and every rule of each group
-with its description.
+Plus the [common output flags](#reports).
 
-Exit codes: 0 no gaps, 1 any gap or warning, 2 fatal.
+### Output
 
-## IAM permissions
+- **Text**: per direction, each gap with its absent access and the overlapping right rules.
+- **CSV / JSON**: every finding. The JSON also holds each group's full rule list with descriptions.
+- **HTML**: finding counts, the groups, per-direction verdicts, and a gaps table per direction. Fully granted left rules are collapsed, and each group's full rule list with descriptions is at the end.
 
-`ec2:DescribeSecurityGroups`, `ec2:DescribeSecurityGroupRules`,
-`ec2:DescribeManagedPrefixLists`, `ec2:GetManagedPrefixListEntries`,
-`sts:GetCallerIdentity`.
+### IAM permissions
+
+`sts:GetCallerIdentity`, `ec2:DescribeSecurityGroups`,
+`ec2:DescribeSecurityGroupRules`, `ec2:DescribeManagedPrefixLists`,
+`ec2:GetManagedPrefixListEntries`.
+
+---
+
+## Repository layout
+
+```
+fmm_rule_parity.py      FMS policy rule parity (A present, B missing)
+fmm_nacl_audit.py       live NACLs vs FMS NACL policy
+sg_access_gap.py        left SG access absent from right SG(s)
+lib/aws_common.py       shared AWS helpers: sessions, clients, FMS policy calls,
+                        region resolution; loads .env and sets up logging
+lib/html_report.py      self-contained interactive HTML report renderer
+.env.example            configuration template
+requirements.txt        Python dependencies
+```

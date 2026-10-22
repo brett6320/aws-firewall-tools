@@ -1,11 +1,45 @@
 #!/usr/bin/env python3
 """
-AWS Firewall Manager (FMS) policy parity review.
+AWS Firewall Manager (FMS) rule parity review.
 
-Walks every Firewall Manager policy in one or more regions, expands the
-rules it carries (security groups, Network Firewall rule groups, network
-ACL entries), and reports every rule where target A matches but no
-sibling rule in the same container matches target B.
+Intent: when access is being moved or duplicated (an old IP to a new prefix
+list, one load balancer to two, a new CIDR alongside an old one), every FMS
+rule that allows target A should have a sibling rule for target B. This tool
+finds the rules where A is allowed but B is not, so nothing is missed.
+
+What it does:
+
+  1. Lists the Firewall Manager policies in one or more regions.
+  2. Expands the rules each policy carries into one normalised form:
+     security group rules (prefix lists expanded), Network Firewall stateless,
+     stateful and Suricata rules (IP set / port set variables and prefix list
+     references resolved), and NACL entries.
+  3. Finds rules matching any A target (IP/CIDR or prefix list, protocol,
+     port) and checks that the same container (or the same policy, with
+     --scope policy) holds a same-shape rule matching the B target(s) in the
+     same role (source or destination).
+  4. Reports each gap, and a compliance status per container
+     (NON_COMPLIANT / COMPLIANT / NOT_APPLICABLE).
+
+Usage:
+
+    ./fmm_rule_parity.py --profile fms-admin --region us-east-1 \
+        -a 10.0.0.1 tcp 8080 -b pl-0123abcd tcp 8080
+
+Configuration (.env, all optional; CLI flags override):
+
+    # AWS profile to use (overridden by --profile)
+    AWS_PROFILE=
+    # Default region(s) when --region not given
+    AWS_REGION=us-east-1
+    # Base directory for auto-saved reports (<dir>/<tool>/YYYY-MM-DD/...)
+    FMM_REPORT_DIR=./reports
+
+Reports: text on screen, plus auto-saved HTML (interactive: filter, sort,
+unique counts), per-container compliance CSV, rule-level gaps CSV and JSON
+under reports/fmm_rule_parity/YYYY-MM-DD/.
+
+Exit codes: 0 no gaps, 1 gaps found, 2 fatal error.
 
 Read-only. No mutating API calls are made.
 """
@@ -29,25 +63,18 @@ import truststore
 truststore.inject_into_ssl()
 
 import boto3  # noqa: E402
-from botocore.config import Config  # noqa: E402
 from botocore.exceptions import ClientError  # noqa: E402
-from dotenv import load_dotenv  # noqa: E402
 
-load_dotenv()
+from lib import html_report  # noqa: E402
+from lib.aws_common import (_g, get_client, get_policy, get_session, list_policies,  # noqa: E402,F401
+                            normalize_proto, resolve_regions)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-log = logging.getLogger("fmm_parity")
+log = logging.getLogger("fmm_rule_parity")
 
 IPNet = ipaddress.IPv4Network | ipaddress.IPv6Network
 PortRange = tuple[int, int]
 ANY_PORTS: PortRange = (0, 65535)
 
-PROTO_NUM_TO_NAME = {"-1": "any", "all": "any", "ip": "any", "any": "any",
-                     "6": "tcp", "17": "udp", "1": "icmp", "58": "icmpv6"}
 
 SUPPORTED_POLICY_TYPES = {
     "SECURITY_GROUPS_COMMON",
@@ -62,6 +89,10 @@ SUPPORTED_POLICY_TYPES = {
 # --------------------------------------------------------------------------- #
 @dataclass
 class Target:
+    """One side of the parity question: an IP/CIDR or managed prefix list, plus protocol and port.
+
+    A targets are what must be present in a rule; B targets are what is expected alongside them.
+    """
     label: str
     nets: list[IPNet]        # one CIDR, or every CIDR of a managed prefix list
     proto: str               # 'tcp', 'udp', 'icmp', 'any', or a protocol number string
@@ -76,6 +107,11 @@ class Target:
     @classmethod
     def parse(cls, label: str, ip: str, proto: str, port: str,
               resolve_pl=None, pl_match: str = "ref") -> "Target":
+        """Build a target from user tokens (IP or prefix list, PROTO, PORT).
+
+        Prefix lists are kept by id for `ref` matching, or expanded through `resolve_pl` for the
+        `cidrs-*` modes. Raises ValueError for unreadable or empty prefix lists.
+        """
         p = normalize_proto(proto)
         ports = None if port.lower() in ("any", "all", "*", "-1") else parse_port_range(port)
         m = cls.PL_RE.search(ip.strip())
@@ -97,12 +133,14 @@ class Target:
         return cls(label=label, nets=[net], proto=p, ports=ports, source=str(net), match="cidrs-all")
 
     def covered_by(self, rule_nets: list[IPNet], rule_pls: list[str]) -> bool:
+        """True when a rule side (its CIDRs and referenced prefix lists) satisfies this target."""
         if self.match == "ref":
             return self.pl_id in rule_pls
         hits = [nets_contain(rule_nets, n) for n in self.nets]
         return all(hits) if self.match == "cidrs-all" else any(hits)
 
     def __str__(self) -> str:
+        """Human-readable target, e.g. '10.0.0.1/32 tcp 8080' or 'pl-123 (prefix list, match=ref) tcp any'."""
         port = "any" if self.ports is None else fmt_ports(self.ports)
         desc = self.source
         if self.pl_id:
@@ -112,6 +150,11 @@ class Target:
 
 @dataclass
 class Rule:
+    """One normalised firewall rule from an FMS policy (SG rule, Network Firewall rule or NACL entry).
+
+    Every policy type is reduced to this shape so A/B matching and parity work the same way
+    across them. `None` for nets/ports means unconstrained (any).
+    """
     region: str
     policy_id: str
     policy_name: str
@@ -161,6 +204,7 @@ class Rule:
         return (self.kind, self.direction, self.action, self.proto)
 
     def to_dict(self) -> dict:
+        """JSON-friendly dict of the rule (networks and ports rendered as strings)."""
         d = asdict(self)
         d["src_nets"] = None if self.src_nets is None else [str(n) for n in self.src_nets]
         d["dst_nets"] = None if self.dst_nets is None else [str(n) for n in self.dst_nets]
@@ -172,28 +216,15 @@ class Rule:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _g(d: dict | None, key: str, default):
-    """dict.get that also treats an explicit null as missing (FMS emits e.g. "securityGroups": null)."""
-    if not d:
-        return default
-    v = d.get(key)
-    return default if v is None else v
-
-
-def normalize_proto(p: str | int | None) -> str:
-    if p is None:
-        return "any"
-    s = str(p).strip().lower()
-    return PROTO_NUM_TO_NAME.get(s, s)
-
-
 def proto_compatible(rule_proto: str, target_proto: str) -> bool:
+    """True when a rule protocol and a target protocol can match (equal, or either is 'any')."""
     if rule_proto == "any" or target_proto == "any":
         return True
     return rule_proto == target_proto
 
 
 def parse_port_range(s: str) -> PortRange:
+    """Parse '8080', '8000-8100' or '8000:8100' into (from, to); 'any'/'*'/'-1' mean all ports."""
     s = s.strip()
     if s.lower() in ("any", "all", "*", "-1", ""):
         return ANY_PORTS
@@ -206,18 +237,21 @@ def parse_port_range(s: str) -> PortRange:
 
 
 def fmt_ports(p: PortRange) -> str:
+    """Render a port range as '8080', '8000-8100' or 'any'."""
     if p == ANY_PORTS:
         return "any"
     return str(p[0]) if p[0] == p[1] else f"{p[0]}-{p[1]}"
 
 
 def ports_contain(ranges: list[PortRange] | None, want: PortRange) -> bool:
+    """True when any range in `ranges` contains `want` (None = unconstrained, contains everything)."""
     if ranges is None:
         return True
     return any(r[0] <= want[0] and want[1] <= r[1] for r in ranges)
 
 
 def nets_contain(nets: list[IPNet] | None, want: IPNet) -> bool:
+    """True when `want` is a subnet of any same-family network in `nets` (None = any)."""
     if nets is None:
         return True
     for n in nets:
@@ -229,6 +263,7 @@ def nets_contain(nets: list[IPNet] | None, want: IPNet) -> bool:
 
 
 def safe_net(s: str) -> IPNet | None:
+    """Parse a CIDR or IP, returning None instead of raising for anything unparseable."""
     try:
         return ipaddress.ip_network(s.strip(), strict=False)
     except ValueError:
@@ -236,32 +271,16 @@ def safe_net(s: str) -> IPNet | None:
 
 
 # --------------------------------------------------------------------------- #
-# AWS plumbing
-# --------------------------------------------------------------------------- #
-def get_session(profile: str | None, region: str) -> boto3.Session:
-    return boto3.Session(profile_name=profile, region_name=region)
-
-
-def get_client(service: str, session: boto3.Session):
-    cfg = Config(retries={"max_attempts": 5, "mode": "adaptive"})
-    return session.client(service, config=cfg)
-
-
-def list_policies(fms) -> Iterator[dict]:
-    paginator = fms.get_paginator("list_policies")
-    for page in paginator.paginate():
-        yield from _g(page, "PolicyList", [])
-
-
-def get_policy(fms, policy_id: str) -> dict:
-    return fms.get_policy(PolicyId=policy_id)["Policy"]
-
-
-# --------------------------------------------------------------------------- #
 # Extractors
 # --------------------------------------------------------------------------- #
 class Extractor:
+    """Reads the rules behind each FMS policy in one region and yields normalised `Rule`s.
+
+    Resolves what the policy references (security groups, Network Firewall rule groups,
+    managed prefix lists) and caches each lookup, since many policies share them.
+    """
     def __init__(self, session: boto3.Session, region: str):
+        """Create the FMS client for `region`; EC2 and Network Firewall clients are made on first use."""
         self.session = session
         self.region = region
         self.fms = get_client("fms", session)
@@ -273,18 +292,24 @@ class Extractor:
 
     @property
     def ec2(self):
+        """Lazily created EC2 client (security groups, prefix lists)."""
         if self._ec2 is None:
             self._ec2 = get_client("ec2", self.session)
         return self._ec2
 
     @property
     def nfw(self):
+        """Lazily created Network Firewall client (rule groups)."""
         if self._nfw is None:
             self._nfw = get_client("network-firewall", self.session)
         return self._nfw
 
     # -- top level ---------------------------------------------------------- #
     def rules_for_policy(self, policy: dict) -> Iterator[Rule]:
+        """Yield every IP/port rule carried by one FMS policy, dispatching on its policy type.
+
+        Policy types without IP/port semantics (WAF, Shield, DNS Firewall, ...) yield nothing.
+        """
         ssp = _g(policy, "SecurityServicePolicyData", {})
         ptype = ssp.get("Type", "")
         msd_raw = ssp.get("ManagedServiceData") or "{}"
@@ -338,11 +363,13 @@ class Extractor:
         return result
 
     def _prefix_list_from_arn(self, arn: str) -> list[IPNet] | None:
+        """Expand a prefix list given by ARN (as in Network Firewall ReferenceSets); None if unreadable."""
         m = self._PL_ARN_RE.search(arn)
         return self._prefix_list_nets(m.group(1)) if m else None
 
     # -- security groups ---------------------------------------------------- #
     def _describe_sg(self, sg_id: str) -> dict | None:
+        """Fetch (and cache) one security group; None if it cannot be read."""
         if sg_id in self._sg_cache:
             return self._sg_cache[sg_id]
         try:
@@ -356,6 +383,11 @@ class Extractor:
         return sg
 
     def _sg_rules(self, sg_id: str, base: dict) -> Iterator[Rule]:
+        """Yield one Rule per CIDR and one per prefix list in a security group's ingress/egress permissions.
+
+        SG-to-SG references and unreadable prefix lists are kept as `unresolved` so they are reported,
+        and unreadable prefix list ids stay matchable by id.
+        """
         sg = self._describe_sg(sg_id)
         if not sg:
             return
@@ -389,6 +421,7 @@ class Extractor:
                 port_txt = fmt_ports(ports[0]) if ports else "any"
 
                 def emit(cidrs: list[IPNet], label: str, unres: list[str], pls: list[str] = []) -> Rule:
+                    """Build the Rule for one CIDR set (or prefix list) of the current permission."""
                     return Rule(
                         **base, container=sg_id, container_name=sg.get("GroupName", ""),
                         kind=f"sg-{direction}", direction=direction,
@@ -414,6 +447,7 @@ class Extractor:
 
     # -- network firewall --------------------------------------------------- #
     def _describe_rg(self, arn: str) -> dict | None:
+        """Fetch (and cache) one Network Firewall rule group; None if it cannot be read."""
         if arn in self._rg_cache:
             return self._rg_cache[arn]
         try:
@@ -426,6 +460,11 @@ class Extractor:
         return rg
 
     def _nfw_rule_group(self, arn: str, base: dict) -> Iterator[Rule]:
+        """Yield the rules of a Network Firewall rule group (stateless, stateful 5-tuple, or Suricata).
+
+        IP set / port set variables and ReferenceSets prefix lists are resolved first so rule
+        addresses can be matched as CIDRs and, for prefix lists, by id.
+        """
         rg = self._describe_rg(arn)
         if not rg:
             return
@@ -464,6 +503,7 @@ class Extractor:
                 log.debug("%s: domain-list rule group, no IP/port rules", arn)
 
     def _nfw_stateless(self, r: dict, idx: int, arn: str, base: dict) -> Iterator[Rule]:
+        """Yield one Rule per protocol of a stateless rule (its match attributes become src/dst nets and ports)."""
         m = _g(_g(r, "RuleDefinition", {}), "MatchAttributes", {})
         actions = ",".join(_g(_g(r, "RuleDefinition", {}), "Actions", []))
         src = [safe_net(s["AddressDefinition"]) for s in _g(m, "Sources", [])] or None
@@ -517,6 +557,10 @@ class Extractor:
 
     @staticmethod
     def _resolve_ports(tok: str, portsets: dict) -> tuple[list[PortRange] | None, list[str]]:
+        """Resolve a Suricata/stateful port token (literal, range, list or $PORTSET) to port ranges.
+
+        Returns (ranges or None = any, unresolved tokens); negations are reported, not evaluated.
+        """
         tok = tok.strip()
         if tok.lower() == "any":
             return None, []
@@ -542,6 +586,7 @@ class Extractor:
 
     def _nfw_stateful(self, r: dict, idx: int, arn: str, base: dict, ipsets, portsets,
                       pl_vars: dict | None = None) -> Rule:
+        """Convert one stateful 5-tuple rule (Header) to a Rule, resolving variables and prefix lists."""
         h = _g(r, "Header", {})
         src, u1, sp_pls = self._resolve_addr(_g(h, "Source", "ANY"), ipsets, pl_vars)
         dst, u2, dp_pls = self._resolve_addr(_g(h, "Destination", "ANY"), ipsets, pl_vars)
@@ -565,6 +610,7 @@ class Extractor:
 
     def _nfw_suricata(self, rules_string: str, arn: str, base: dict, ipsets, portsets,
                       pl_vars: dict | None = None) -> Iterator[Rule]:
+        """Parse the header of each Suricata rule in a RulesString into a Rule; unparseable lines are skipped."""
         for lineno, line in enumerate(rules_string.splitlines(), 1):
             s = line.strip()
             if not s or s.startswith("#"):
@@ -588,6 +634,7 @@ class Extractor:
 
     # -- network ACL -------------------------------------------------------- #
     def _nacl_rule(self, e: dict, idx: int, container: str, base: dict) -> Rule:
+        """Convert one NACL entry from the policy's networkAclEntrySet into a Rule."""
         egress = bool(e.get("egress", False))
         proto = normalize_proto(_g(e, "protocol", "-1"))
         pr = e.get("portRange")
@@ -636,6 +683,7 @@ class TargetSet:
         return seen
 
     def __str__(self) -> str:
+        """Targets with their labels, plus the match mode when there are several."""
         items = "; ".join(f"{t.label}={t}" for t in self.targets)
         suffix = f" (match {self.mode})" if len(self.targets) > 1 else ""
         return items + suffix
@@ -646,6 +694,7 @@ class TargetSet:
 # --------------------------------------------------------------------------- #
 @dataclass
 class Finding:
+    """A parity gap: a rule matching A in some role with no same-shape B counterpart in scope."""
     rule: Rule
     roles_a: list[str]
     a_hits: dict[str, list[str]]       # which A targets matched, with roles
@@ -653,6 +702,7 @@ class Finding:
     reason: str
 
     def to_dict(self) -> dict:
+        """JSON-friendly dict of the finding."""
         return {"rule": self.rule.to_dict(), "roles_a": self.roles_a, "a_hits": self.a_hits,
                 "missing_b": self.missing_b, "reason": self.reason}
 
@@ -664,6 +714,7 @@ def analyze(rules: list[Rule], A: TargetSet, B: TargetSet, scope: str) -> tuple[
     role when any (B.mode='any') or every (B.mode='all') B target has one.
     """
     def scope_key(r: Rule) -> tuple:
+        """Where a B counterpart must live: the same container, or anywhere in the same policy."""
         if scope == "policy":
             return (r.region, r.policy_id)
         return (r.region, r.policy_id, r.container)
@@ -715,6 +766,7 @@ CSV_COLUMNS = [
 
 
 def _fmt_hits(h: dict[str, list[str]]) -> str:
+    """Render target hits as 'A1:src;A2:src/dst' for CSV cells."""
     return ";".join(f"{k}:{'/'.join(v)}" for k, v in h.items())
 
 
@@ -750,6 +802,9 @@ def build_rows(rules: list[Rule], findings: list[Finding], A: TargetSet, B: Targ
 
 def build_json(rules: list[Rule], findings: list[Finding], stats: dict, A: TargetSet, B: TargetSet,
                scope: str, include_all: bool, regions: list[str]) -> dict:
+    """Assemble the JSON report: targets, settings, stats, findings, per-container compliance
+    (and every A/B-matching rule with --show-all).
+    """
     out = {
         "targets_a": [{"label": t.label, "target": str(t)} for t in A.targets],
         "targets_b": [{"label": t.label, "target": str(t)} for t in B.targets],
@@ -766,6 +821,7 @@ def build_json(rules: list[Rule], findings: list[Finding], stats: dict, A: Targe
 
 
 def write_csv(path: str, rows: list[dict]) -> None:
+    """Write the rule-level gaps CSV (`build_rows` output)."""
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
         w.writeheader()
@@ -774,6 +830,7 @@ def write_csv(path: str, rows: list[dict]) -> None:
 
 
 def write_json(path: str, payload: dict) -> None:
+    """Write the JSON report."""
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=str)
     log.info("Wrote JSON to %s", path)
@@ -831,6 +888,7 @@ def build_container_report(rules: list[Rule], findings: list[Finding], A: Target
 
 
 def write_report_csv(path: str, report: list[dict]) -> None:
+    """Write the per-container compliance CSV (list cells joined with ';' / ' | ')."""
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=REPORT_COLUMNS)
         w.writeheader()
@@ -843,6 +901,7 @@ def write_report_csv(path: str, report: list[dict]) -> None:
 
 
 def print_container_report(report: list[dict], sg_only: bool) -> None:
+    """Print the compliance table (security groups only unless `sg_only` is False)."""
     rows = [r for r in report if r["container_type"] == "SG"] if sg_only else report
     label = "security group" if sg_only else "container"
     counts = {s: sum(1 for r in rows if r["status"] == s)
@@ -864,7 +923,65 @@ def print_container_report(report: list[dict], sg_only: bool) -> None:
     print()
 
 
+def render_html(rules: list[Rule], findings: list[Finding], stats: dict, A: TargetSet, B: TargetSet,
+                scope: str, regions: list[str], report: list[dict]) -> str:
+    """Build the interactive HTML report: run totals, compliance by container, and every rule
+    matching A or B with gaps marked. Non-applicable containers and non-gap rules start hidden.
+    """
+    status = [r["status"] for r in report]
+    cards = [(len(regions), "regions"), (len({r.policy_id for r in rules}), "policies"),
+             (stats["rules_total"], "rules inspected"), (stats["a_matches"], "A matches"),
+             (stats["b_matches"], "B matches"), (stats["a_without_b"], "A without B"),
+             (status.count("NON_COMPLIANT"), "non-compliant containers"),
+             (status.count("COMPLIANT"), "compliant containers")]
+    meta = [f"Targets A: {A}", f"Targets B: {B}",
+            f"Scope: {scope} · regions: {', '.join(regions)} · generated {dt.datetime.now():%Y-%m-%d %H:%M:%S}"]
+    containers = {
+        "id": "containers", "title": "Compliance by container", "row_label": "containers",
+        "note": "NON_COMPLIANT: a rule matches A with no B counterpart. COMPLIANT: A present and every A rule has "
+                "its B counterpart. NOT_APPLICABLE: no A target in this container.",
+        "columns": [["status", "Status"], ["region", "Region"], ["container_type", "Type"],
+                    ["container", "Container"], ["container_name", "Name"], ["policies", "Policies"],
+                    ["rules_total", "Rules"], ["rules_matching_a", "A rules"], ["rules_matching_b", "B rules"],
+                    ["gaps", "Gaps"], ["a_targets_seen", "A seen"], ["b_targets_seen", "B seen"],
+                    ["gap_rules", "Gap rules"]],
+        "rows": report,
+        "filters": ["status", "region", "container_type", "policies"],
+        "uniq": [["region", "Regions"], ["policies", "Policies"], ["container_type", "Types"]],
+        "wrap": ["policies", "gap_rules"],
+        "badges": {"status": {"NON_COMPLIANT": "error", "COMPLIANT": "ok", "NOT_APPLICABLE": "info"}},
+        "order": {"status": ["NON_COMPLIANT", "COMPLIANT", "NOT_APPLICABLE"]},
+        "sort": [["status", 1], ["container_type", 1], ["region", 1]],
+        "hide": {"key": "status", "values": ["NOT_APPLICABLE"], "label": "show not applicable"},
+        "by": {"key": "container_type", "label": "By container type", "badge": None},
+    }
+    rows = [{**r, "gap": "GAP" if r["gap"] else "ok"} for r in build_rows(rules, findings, A, B, include_all=True)]
+    rule_table = {
+        "id": "rules", "title": "Rules matching A or B", "row_label": "rules",
+        "note": "GAP rows match an A target with no B counterpart in the same " + scope + ".",
+        "columns": [["gap", "Gap"], ["matches_a", "A role"], ["a_targets", "A targets"], ["matches_b", "B role"],
+                    ["b_targets", "B targets"], ["region", "Region"], ["policy_name", "Policy"],
+                    ["policy_type", "Policy type"], ["container", "Container"], ["container_name", "Name"],
+                    ["kind", "Kind"], ["direction", "Direction"], ["action", "Action"], ["proto", "Proto"],
+                    ["src_nets", "Source"], ["dst_nets", "Destination"], ["src_ports", "Src ports"],
+                    ["dst_ports", "Dst ports"], ["raw", "Rule"], ["reason", "Reason"],
+                    ["unresolved", "Unresolved"]],
+        "rows": rows,
+        "filters": ["gap", "region", "policy_name", "policy_type", "container", "kind", "direction", "action",
+                    "proto"],
+        "uniq": [["region", "Regions"], ["policy_name", "Policies"], ["container", "Containers"]],
+        "wrap": ["src_nets", "dst_nets", "raw", "reason", "unresolved"],
+        "badges": {"gap": {"GAP": "error", "ok": "ok"}},
+        "order": {"gap": ["GAP", "ok"]},
+        "sort": [["gap", 1], ["region", 1], ["policy_name", 1], ["container", 1]],
+        "hide": {"key": "gap", "values": ["ok"], "label": "show rules without a gap"},
+        "by": {"key": "policy_name", "label": "By policy", "badge": None},
+    }
+    return html_report.render("FMS rule parity report", meta=meta, cards=cards, tables=[containers, rule_table])
+
+
 def _slug(ts: TargetSet) -> str:
+    """Filename-safe summary of a target set, shortened with a hash when long."""
     parts = []
     for t in ts.targets:
         port = "any" if t.ports is None else fmt_ports(t.ports)
@@ -877,14 +994,15 @@ def _slug(ts: TargetSet) -> str:
 
 
 def default_report_paths(out_dir: str, A: TargetSet, B: TargetSet, now: dt.datetime | None = None) -> dict[str, Path]:
-    """./reports/YYYY-MM-DD/HHMMSS_<A>_vs_<B>.{compliance.csv,gaps.csv,json}"""
+    """./reports/fmm_rule_parity/YYYY-MM-DD/HHMMSS_parity_<A>_vs_<B>.{html,compliance.csv,gaps.csv,json}"""
     now = now or dt.datetime.now()
-    day_dir = Path(out_dir) / now.strftime("%Y-%m-%d")
-    stem = f"{now.strftime('%H%M%S')}_{_slug(A)}_vs_{_slug(B)}"
+    day_dir = Path(out_dir) / "fmm_rule_parity" / now.strftime("%Y-%m-%d")
+    stem = f"{now.strftime('%H%M%S')}_parity_{_slug(A)}_vs_{_slug(B)}"
     return {
         "report": day_dir / f"{stem}.compliance.csv",
         "csv": day_dir / f"{stem}.gaps.csv",
         "json": day_dir / f"{stem}.json",
+        "html": day_dir / f"{stem}.html",
     }
 
 
@@ -914,6 +1032,7 @@ def split_target_tokens(tokens: list[str]) -> tuple[str, str, str]:
 
 
 def parse_targets(side: str, specs: list[list[str]], mode: str, resolve_pl, pl_match: str) -> TargetSet:
+    """Parse the -a or -b arguments into a labelled TargetSet (A1, A2, ... when several)."""
     targets = []
     for i, tokens in enumerate(specs, 1):
         label = f"{side}{i}" if len(specs) > 1 else side
@@ -922,28 +1041,11 @@ def parse_targets(side: str, specs: list[list[str]], mode: str, resolve_pl, pl_m
     return TargetSet(side=side, targets=targets, mode=mode)
 
 
-def resolve_regions(profile: str | None, region_args: list[str] | None, all_regions: bool) -> list[str]:
-    """--region is repeatable and comma-separable; --all-regions enumerates enabled regions that have FMS."""
-    if all_regions:
-        session = get_session(profile, os.getenv("AWS_REGION", "us-east-1"))
-        enabled = {r["RegionName"] for r in get_client("ec2", session).describe_regions(
-            Filters=[{"Name": "opt-in-status", "Values": ["opt-in-not-required", "opted-in"]}])["Regions"]}
-        fms_regions = set(session.get_available_regions("fms"))
-        regions = sorted(enabled & fms_regions)
-        log.info("--all-regions: %d regions with Firewall Manager: %s", len(regions), ", ".join(regions))
-        return regions
-    out: list[str] = []
-    for item in region_args or []:
-        for r in item.split(","):
-            r = r.strip()
-            if r and r not in out:
-                out.append(r)
-    if not out:
-        out = [x.strip() for x in os.getenv("AWS_REGION", "us-east-1").split(",") if x.strip()]
-    return out
-
-
 def collect_rules(profile: str | None, regions: Iterable[str], policy_filter: str | None) -> list[Rule]:
+    """Read every supported FMS policy in the given regions and return all of their rules.
+
+    List/get failures are logged and that region or policy is skipped.
+    """
     rules: list[Rule] = []
     for region in regions:
         log.info("Region %s: listing Firewall Manager policies", region)
@@ -976,6 +1078,9 @@ def collect_rules(profile: str | None, regions: Iterable[str], policy_filter: st
 
 def print_report(findings: list[Finding], stats: dict, A: TargetSet, B: TargetSet,
                  rules: list[Rule], show_all: bool, regions: list[str]) -> None:
+    """Print the text report: run summary, optional A/B matches, then each gap grouped by
+    region / policy / container with its reason.
+    """
     print()
     print(f"Regions:   {', '.join(regions)}")
     print(f"Targets A: {A}")
@@ -1009,6 +1114,7 @@ def print_report(findings: list[Finding], stats: dict, A: TargetSet, B: TargetSe
 
 
 def main() -> int:
+    """Command-line entry point. Returns the exit code: 0 no gaps, 1 gaps, 2 fatal."""
     p = argparse.ArgumentParser(
         description="Find AWS Firewall Manager rules where any A target is present but B target(s) are missing.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1047,10 +1153,11 @@ Example:
     p.add_argument("--show-all", action="store_true", help="Also list every rule matching any A or B target")
     p.add_argument("--json", action="store_true", help="Emit JSON to stdout instead of text report")
     p.add_argument("--out-dir", default=os.getenv("FMM_REPORT_DIR", "./reports"),
-                   help="Base directory for auto-saved reports, organised as <out-dir>/YYYY-MM-DD/ "
+                   help="Base directory for auto-saved reports, organised as <out-dir>/fmm_rule_parity/YYYY-MM-DD/ "
                         "(default: ./reports, env FMM_REPORT_DIR)")
     p.add_argument("--no-save", action="store_true", help="Do not auto-save reports to --out-dir")
     p.add_argument("--json-out", metavar="PATH", help="Write JSON report to file (overrides auto path)")
+    p.add_argument("--html-out", metavar="PATH", help="Write HTML report to file (overrides auto path)")
     p.add_argument("--report-out", metavar="PATH",
                    help="Write per-container compliance CSV (overrides auto path)")
     p.add_argument("--all-containers", action="store_true",
@@ -1107,7 +1214,8 @@ Example:
     json_path = args.json_out or auto.get("json")
     csv_path = args.csv_out or auto.get("csv")
     report_path = args.report_out or auto.get("report")
-    for path in (json_path, csv_path, report_path):
+    html_path = args.html_out or auto.get("html")
+    for path in (json_path, csv_path, report_path, html_path):
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
     if json_path:
@@ -1116,6 +1224,10 @@ Example:
         write_csv(str(csv_path), build_rows(rules, findings, A, B, args.show_all))
     if report_path:
         write_report_csv(str(report_path), report)
+    if html_path:
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(render_html(rules, findings, stats, A, B, args.scope, regions, report))
+        log.info("Wrote HTML to %s", html_path)
 
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
@@ -1123,7 +1235,7 @@ Example:
         print_report(findings, stats, A, B, rules, args.show_all, regions)
         print()
         print_container_report(report, sg_only=not args.all_containers)
-        saved = [str(x) for x in (report_path, csv_path, json_path) if x]
+        saved = [str(x) for x in (html_path, report_path, csv_path, json_path) if x]
         if saved:
             print("Saved:")
             for x in saved:
