@@ -204,3 +204,72 @@ and in which role, e.g. `A1:src;A2:src`. Multi-valued cells are
 `;`-separated; `any` means unconstrained. `matches_a`/`matches_b` hold the
 role(s) (`src`, `dst`, `any`) or blank for no match. Without `--show-all` only
 `gap=True` rows are written.
+
+---
+
+# sg_diff
+
+Compares the rules of two or more security groups in one account by the
+access they grant, not by how the rules are written. The first group is the
+baseline; each other group is compared against it in both directions, for
+ingress and egress separately. Descriptions are shown for reference but never
+compared.
+
+## Usage
+
+```bash
+python sg_diff.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210
+python sg_diff.py --profile prod-admin \
+  arn:aws:ec2:us-east-1:111122223333:security-group/sg-0123456789abcdef0 \
+  arn:aws:ec2:us-east-1:111122223333:security-group/sg-0fedcba9876543210
+```
+
+Groups may be ARNs or ids (mixed is fine). ARNs carry their region; bare ids
+use `--region`, then `AWS_REGION`, then the profile's region. All groups must
+be in one account: ARNs naming different accounts, a profile whose account
+(`sts:GetCallerIdentity`) differs from the ARNs, or groups with different
+owners stop the run (exit 2).
+
+## How rules are compared
+
+Each rule becomes a set of boxes: protocol × port range (or ICMP type/code) ×
+address range. Prefix lists are expanded to their current entries. A rule from
+one group is then checked against all rules of the other group in the same
+direction:
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `MISSING` | error | Nothing in the other group overlaps this rule |
+| `PARTIAL` | error | The other group grants only part of it; `uncovered` lists the exact remainder (CIDRs, ports, ICMP types) |
+| `COVERED` | warn | The other group grants all of it through different rules (prefix list vs. its CIDRs, /16 vs. two /17s, a broader rule) |
+| `IDENTICAL` | info | Same protocol, ports and peer (hidden unless `--show-identical`) |
+| `PREFIX_LIST_UNRESOLVED` | warn | Prefix list entries could not be read; rules using it are compared by id only |
+| `DIFFERENT_VPCS` | info | Groups are in different VPCs, so group references may not be comparable |
+
+Every finding lists the overlapping rules from the other group, with their
+descriptions. A broader rule on one side shows as `COVERED` on the narrow side
+and `PARTIAL` on the broad side. Security group references match by group id;
+a self-reference matches the other group's self-reference. IPv4 and IPv6 are
+separate spaces.
+
+Each pair gets a per-direction verdict: `identical`, `equivalent` (same access,
+different rules) or `differs`.
+
+## Options
+
+| Option | Description |
+|---|---|
+| `SG ...` | Group ARNs or ids; first is the baseline |
+| `--profile` | AWS profile (default `AWS_PROFILE`) |
+| `--region` | Region for bare ids |
+| `--show-identical` | Also list exact matches |
+| `--json` / `--json-out` / `--csv-out` | Output, as for the other tools |
+| `--out-dir` / `--no-save` | Auto-saved reports under `reports/YYYY-MM-DD/HHMMSS_sgdiff_<ids>.*` |
+
+Exit codes: 0 no differences, 1 any error/warn finding, 2 fatal.
+
+## IAM permissions
+
+`ec2:DescribeSecurityGroups`, `ec2:DescribeSecurityGroupRules`,
+`ec2:DescribeManagedPrefixLists`, `ec2:GetManagedPrefixListEntries`,
+`sts:GetCallerIdentity`.
