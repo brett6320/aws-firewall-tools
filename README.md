@@ -305,7 +305,8 @@ Accounts with no profile are reported as `NO_PROFILE`.
 | `--limit N` | Rules-per-direction limit (default 30, env `FMM_NACL_LIMIT`) |
 | `--headroom N` | Also flag NACLs within N rules of the limit (default 3, env `FMM_NACL_HEADROOM`) |
 | `--show-info` | Show info findings |
-| `--json`, `--json-out`, `--csv-out`, `--out-dir`, `--no-save` | As in `fmm_parity.py`; auto-saves `reports/YYYY-MM-DD/HHMMSS_nacl_<policy>.{json,csv}` |
+| `--json`, `--json-out`, `--csv-out`, `--out-dir`, `--no-save` | As in `fmm_parity.py`; auto-saves `reports/YYYY-MM-DD/HHMMSS_nacl_<policy>.{html,json,csv}` |
+| `--html-out PATH` | Write the HTML report here (overrides auto path) |
 
 Exit code `1` on any error/warn finding, `2` on a fatal error, else `0`.
 
@@ -326,6 +327,24 @@ Exit code `1` on any error/warn finding, `2` on a fatal error, else `0`.
 | `CUSTOM_OUTSIDE_RANGE` | info | Rule that matches no policy first/last rule (in any position) and is numbered outside the 5000–32000 custom range |
 
 `baseline` on each finding is `file`, `live`, or `file-vs-live`.
+
+## HTML report
+
+A single self-contained file (data embedded, no external assets, follows the
+system light/dark setting):
+
+- Run totals: policies, accounts scanned/skipped, NACLs checked, findings by severity.
+- Filters: free-text search plus dropdowns for severity, code, region, policy,
+  account, VPC, NACL, direction and baseline (each option shows its count).
+  Clicking a cell in one of those columns filters on it. Info findings are
+  hidden until "show info" is ticked.
+- Unique counts for the current filter: findings, accounts, regions, policies,
+  VPCs, NACLs, subnets, finding codes; and a per-code table with the same
+  unique counts.
+- Sortable findings table: click a header, shift-click for a secondary sort.
+- The filter and sort live in the URL fragment, so a filtered view can be
+  bookmarked or shared along with the file; "Download filtered CSV" exports
+  the rows currently shown.
 
 ## IAM permissions
 

@@ -683,8 +683,204 @@ def print_report(findings: list[Finding], stats: dict, show_info: bool) -> None:
         print(f"\n({hidden} info findings hidden; --show-info to list)")
 
 
-def write_outputs(findings: list[Finding], stats: dict, json_path, csv_path) -> None:
-    for path in (json_path, csv_path):
+HTML_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NACL drift report</title>
+<style>
+:root { --bg:#fff; --fg:#1d2329; --muted:#5b6670; --line:#d9dee3; --card:#f6f8fa; --hl:#eef3f8;
+  --error:#b42318; --error-bg:#fde8e7; --warn:#9a6700; --warn-bg:#fff4d6; --info:#305d9c; --info-bg:#e6effa; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1418; --fg:#e3e8ec; --muted:#97a3ad; --line:#2c353d;
+  --card:#161d23; --hl:#1b252e; --error:#ff8a80; --error-bg:#3d1714; --warn:#f2c14e; --warn-bg:#3a2e0e;
+  --info:#8ab4f8; --info-bg:#14243b; } }
+body { background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  margin:0 auto; padding:24px 16px; max-width:1600px; }
+h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:24px 0 8px; } .muted { color:var(--muted); }
+.mono, td.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; }
+.cards { display:flex; flex-wrap:wrap; gap:10px; margin:12px 0; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 14px; min-width:96px; }
+.card b { display:block; font-size:20px; } .card span { color:var(--muted); font-size:12px; }
+.controls { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:end; background:var(--card);
+  border:1px solid var(--line); border-radius:8px; padding:10px 12px; position:sticky; top:0; z-index:2; }
+.controls label { display:flex; flex-direction:column; font-size:11px; color:var(--muted); gap:2px; }
+.controls label.check { flex-direction:row; align-items:center; gap:6px; font-size:13px; color:var(--fg); }
+select, input[type=search], button { font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
+  border:1px solid var(--line); border-radius:6px; padding:4px 6px; max-width:220px; }
+input[type=search] { width:220px; } button { cursor:pointer; }
+.wrap { overflow-x:auto; }
+table { border-collapse:collapse; width:100%; margin:6px 0 12px; }
+th, td { text-align:left; vertical-align:top; padding:5px 8px; border-bottom:1px solid var(--line); }
+th { color:var(--muted); font-weight:600; font-size:12px; white-space:nowrap; cursor:pointer; user-select:none; }
+th.sorted::after { content:" \\25B2"; } th.sorted.desc::after { content:" \\25BC"; }
+tr:hover td { background:var(--hl); }
+td.nw { white-space:nowrap; } td.f { cursor:pointer; } td.f:hover { text-decoration:underline dotted; }
+.badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; font-weight:600; }
+.error { color:var(--error); background:var(--error-bg); } .warn { color:var(--warn); background:var(--warn-bg); }
+.info { color:var(--info); background:var(--info-bg); }
+</style></head><body>
+<h1>NACL drift report</h1>
+<div class="muted" id="meta"></div>
+<div class="cards" id="run"></div>
+<div class="controls" id="controls">
+  <label>Search<input type="search" id="q" placeholder="any text"></label>
+  <span id="selects" style="display:contents"></span>
+  <label class="check"><input type="checkbox" id="info"> show info</label>
+  <button id="reset">Reset</button>
+  <button id="csv">Download filtered CSV</button>
+</div>
+<h2>Matching findings <span class="muted" id="shown"></span></h2>
+<div class="cards" id="uniq"></div>
+<h2>By code</h2>
+<div class="wrap"><table id="bycode"></table></div>
+<h2>Findings</h2>
+<div class="muted">Click a header to sort (shift-click adds a secondary sort). Click a cell in a filterable column to filter on it.</div>
+<div class="wrap"><table id="tbl"></table></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(() => {
+const D = JSON.parse(document.getElementById("data").textContent);
+const ALL = D.findings.map(f => ({...f, subnets: (f.subnets || []).join(", ")}));
+const COLS = [["severity","Severity"],["code","Code"],["region","Region"],["policy_name","Policy"],
+  ["account","Account"],["profile","Profile"],["vpc_id","VPC"],["nacl_id","NACL"],["subnets","Subnets"],
+  ["baseline","Baseline"],["direction","Direction"],["position","Position"],["expected","Expected"],
+  ["actual","Actual"],["detail","Detail"]];
+const FILTERS = ["severity","code","region","policy_name","account","vpc_id","nacl_id","direction","baseline"];
+const WRAP = ["subnets","expected","actual","detail"];
+const LABEL = Object.fromEntries(COLS);
+const SEV = {error:0, warn:1, info:2};
+const UNIQ = [["account","Accounts"],["region","Regions"],["policy_name","Policies"],["vpc_id","VPCs"],
+  ["nacl_id","NACLs"],["subnet","Subnets"],["code","Finding codes"]];
+const st = {q:"", info:false, f:{}, sort:[["severity",1]]};
+const el = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const card = (n, label) => `<div class="card"><b>${n}</b><span>${esc(label)}</span></div>`;
+
+const s = D.stats || {};
+el("meta").textContent = `Generated ${D.generated}` + (D.policy ? ` · policy ${D.policy}` : "");
+el("run").innerHTML = card(s.policies ?? "-", "policies") + card(s.accounts ?? "-", "accounts scanned") +
+  card(s.accounts_skipped ?? "-", "accounts skipped") + card(s.nacls ?? "-", "NACLs checked") +
+  ["error","warn","info"].map(v => card(ALL.filter(f => f.severity === v).length, v + " findings")).join("");
+
+el("selects").innerHTML = FILTERS.map(k => {
+  const counts = {};
+  ALL.forEach(f => { if (f[k]) counts[f[k]] = (counts[f[k]] || 0) + 1; });
+  const keys = Object.keys(counts).sort((a, b) => k === "severity" ? SEV[a] - SEV[b] : a.localeCompare(b, undefined, {numeric:true}));
+  return `<label>${LABEL[k]}<select data-k="${k}"><option value="">All (${keys.length})</option>` +
+    keys.map(v => `<option value="${esc(v)}">${esc(v)} (${counts[v]})</option>`).join("") + `</select></label>`;
+}).join("");
+
+function rows() {
+  const q = st.q.toLowerCase();
+  return ALL.filter(f => (st.info || f.severity !== "info" || st.f.severity === "info")
+    && Object.entries(st.f).every(([k, v]) => !v || f[k] === v)
+    && (!q || COLS.some(([k]) => String(f[k] ?? "").toLowerCase().includes(q))));
+}
+function cmp(a, b) {
+  for (const [k, d] of st.sort) {
+    const x = k === "severity" ? SEV[a[k]] : a[k] ?? "", y = k === "severity" ? SEV[b[k]] : b[k] ?? "";
+    const c = typeof x === "number" ? x - y : String(x).localeCompare(String(y), undefined, {numeric:true});
+    if (c) return c * d;
+  }
+  return 0;
+}
+function uniq(rs, k) {
+  const set = new Set();
+  rs.forEach(f => k === "subnet" ? (f.subnets ? f.subnets.split(", ") : []).forEach(x => set.add(x))
+                                  : f[k] && set.add(f[k]));
+  return set.size;
+}
+function saveHash() {
+  const p = new URLSearchParams();
+  Object.entries(st.f).forEach(([k, v]) => v && p.set(k, v));
+  if (st.q) p.set("q", st.q);
+  if (st.info) p.set("info", "1");
+  p.set("sort", st.sort.map(([k, d]) => (d < 0 ? "-" : "") + k).join(","));
+  history.replaceState(null, "", "#" + p.toString());
+}
+function loadHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  FILTERS.forEach(k => { if (p.get(k)) st.f[k] = p.get(k); });
+  st.q = p.get("q") || "";
+  st.info = p.get("info") === "1";
+  if (p.get("sort")) st.sort = p.get("sort").split(",").filter(x => LABEL[x.replace(/^-/, "")])
+    .map(x => x.startsWith("-") ? [x.slice(1), -1] : [x, 1]);
+  if (!st.sort.length) st.sort = [["severity", 1]];
+  el("q").value = st.q; el("info").checked = st.info;
+  document.querySelectorAll("select[data-k]").forEach(x => x.value = st.f[x.dataset.k] || "");
+}
+function render() {
+  saveHash();
+  const rs = rows().sort(cmp);
+  el("shown").textContent = `(${rs.length} of ${ALL.length})`;
+  el("uniq").innerHTML = card(rs.length, "findings") + UNIQ.map(([k, l]) => card(uniq(rs, k), l)).join("");
+  const by = {};
+  rs.forEach(f => (by[f.code] = by[f.code] || {sev: f.severity, rs: []}).rs.push(f));
+  el("bycode").innerHTML = `<tr><th>Code</th><th>Severity</th><th>Findings</th>` +
+    UNIQ.filter(([k]) => k !== "code").map(([, l]) => `<th>${l}</th>`).join("") + `</tr>` +
+    Object.entries(by).sort((a, b) => SEV[a[1].sev] - SEV[b[1].sev] || b[1].rs.length - a[1].rs.length)
+      .map(([c, v]) => `<tr><td class="mono f" data-k="code" data-v="${esc(c)}">${esc(c)}</td>` +
+        `<td><span class="badge ${v.sev}">${v.sev}</span></td><td>${v.rs.length}</td>` +
+        UNIQ.filter(([k]) => k !== "code").map(([k]) => `<td>${uniq(v.rs, k)}</td>`).join("") + `</tr>`).join("");
+  const sorted = Object.fromEntries(st.sort.map(([k, d]) => [k, d]));
+  el("tbl").innerHTML = `<tr>` + COLS.map(([k, l]) =>
+      `<th data-s="${k}" class="${k in sorted ? "sorted" + (sorted[k] < 0 ? " desc" : "") : ""}">${l}</th>`).join("") + `</tr>` +
+    rs.map(f => `<tr>` + COLS.map(([k]) => {
+      const v = f[k] ?? "", fl = FILTERS.includes(k) && v ? ` f" data-k="${k}" data-v="${esc(v)}` : "";
+      if (k === "severity") return `<td class="${fl.trim() ? "f" : ""}" data-k="${k}" data-v="${esc(v)}"><span class="badge ${esc(v)}">${esc(v)}</span></td>`;
+      return `<td class="mono${WRAP.includes(k) ? "" : " nw"}${fl}">${esc(v)}</td>`;
+    }).join("") + `</tr>`).join("");
+}
+function setFilter(k, v) {
+  st.f[k] = v;
+  const sel = document.querySelector(`select[data-k="${k}"]`);
+  if (sel) sel.value = v;
+  render();
+}
+document.addEventListener("change", e => { if (e.target.dataset.k) setFilter(e.target.dataset.k, e.target.value); });
+el("q").addEventListener("input", e => { st.q = e.target.value; render(); });
+el("info").addEventListener("change", e => { st.info = e.target.checked; render(); });
+el("reset").addEventListener("click", () => {
+  st.q = ""; st.f = {}; st.info = false; st.sort = [["severity", 1]];
+  el("q").value = ""; el("info").checked = false;
+  document.querySelectorAll("select[data-k]").forEach(x => x.value = "");
+  render();
+});
+document.addEventListener("click", e => {
+  const th = e.target.closest("th[data-s]");
+  if (th) {
+    const k = th.dataset.s, i = st.sort.findIndex(([x]) => x === k);
+    if (e.shiftKey) { i >= 0 ? st.sort[i][1] *= -1 : st.sort.push([k, 1]); }
+    else st.sort = [[k, i === 0 ? -st.sort[0][1] : 1]];
+    return render();
+  }
+  const td = e.target.closest("td.f");
+  if (td && td.dataset.k) setFilter(td.dataset.k, td.dataset.v);
+});
+el("csv").addEventListener("click", () => {
+  const q = v => /[",\\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+  const lines = [COLS.map(([k]) => k).join(",")].concat(
+    rows().sort(cmp).map(f => COLS.map(([k]) => q(String(f[k] ?? ""))).join(",")));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\\n")], {type: "text/csv"}));
+  a.download = "nacl_drift_filtered.csv";
+  a.click();
+});
+loadHash();
+render();
+})();
+</script></body></html>
+"""
+
+
+def render_html(findings: list[Finding], stats: dict, policy: str = "") -> str:
+    data = {"generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "policy": policy, "stats": stats,
+            "findings": [asdict(f) for f in findings]}
+    # Inside <script type=application/json>, only "</" can end the element early.
+    return HTML_TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
+
+
+def write_outputs(findings: list[Finding], stats: dict, json_path, csv_path, html_path=None, policy: str = "") -> None:
+    for path in (json_path, csv_path, html_path):
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
     if json_path:
@@ -698,6 +894,10 @@ def write_outputs(findings: list[Finding], stats: dict, json_path, csv_path) -> 
             for f in findings:
                 w.writerow({**asdict(f), "subnets": ";".join(f.subnets)})
         log.info("Wrote %d rows to %s", len(findings), csv_path)
+    if html_path:
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(render_html(findings, stats, policy))
+        log.info("Wrote HTML to %s", html_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -743,6 +943,7 @@ def main() -> int:
     p.add_argument("--json", action="store_true", help="Emit JSON to stdout instead of text report")
     p.add_argument("--json-out", metavar="PATH", help="Write JSON report (overrides auto path)")
     p.add_argument("--csv-out", metavar="PATH", help="Write CSV report (overrides auto path)")
+    p.add_argument("--html-out", metavar="PATH", help="Write HTML report (overrides auto path)")
     p.add_argument("--out-dir", default=os.getenv("FMM_REPORT_DIR", "./reports"),
                    help="Base directory for auto-saved reports (default ./reports, env FMM_REPORT_DIR)")
     p.add_argument("--no-save", action="store_true", help="Do not auto-save reports")
@@ -776,16 +977,18 @@ def main() -> int:
         now = dt.datetime.now()
         slug = re.sub(r"[^A-Za-z0-9._-]+", "_", args.policy or Path(args.policy_file or "all").stem)[:48]
         stem = Path(args.out_dir) / now.strftime("%Y-%m-%d") / f"{now.strftime('%H%M%S')}_nacl_{slug}"
-        paths = {"json": f"{stem}.json", "csv": f"{stem}.csv"}
+        paths = {"json": f"{stem}.json", "csv": f"{stem}.csv", "html": f"{stem}.html"}
     json_path = args.json_out or paths.get("json")
     csv_path = args.csv_out or paths.get("csv")
-    write_outputs(findings, stats, json_path, csv_path)
+    html_path = args.html_out or paths.get("html")
+    write_outputs(findings, stats, json_path, csv_path, html_path,
+                  policy=args.policy or (Path(args.policy_file).name if args.policy_file else ""))
 
     if args.json:
         print(json.dumps({"stats": stats, "findings": [asdict(f) for f in findings]}, indent=2))
     else:
         print_report(findings, stats, args.show_info)
-        saved = [x for x in (csv_path, json_path) if x]
+        saved = [x for x in (html_path, csv_path, json_path) if x]
         if saved:
             print("\nSaved:\n" + "\n".join(f"  {x}" for x in saved))
 
