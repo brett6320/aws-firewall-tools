@@ -264,7 +264,14 @@ different rules) or `differs`.
 | `--region` | Region for bare ids |
 | `--show-identical` | Also list exact matches |
 | `--json` / `--json-out` / `--csv-out` | Output, as for the other tools |
-| `--out-dir` / `--no-save` | Auto-saved reports under `reports/YYYY-MM-DD/HHMMSS_sgdiff_<ids>.*` |
+| `--html-out` | Write the HTML report here (overrides auto path) |
+| `--out-dir` / `--no-save` | Auto-saved reports under `reports/YYYY-MM-DD/HHMMSS_sgdiff_<ids>.{html,csv,json}` |
+
+The HTML report is a single self-contained file (no external assets, follows
+the system light/dark setting): finding counts, the groups, per-pair verdicts,
+a findings table per direction and side with uncovered remainders and the other
+group's overlapping rules (identical matches collapsed), and every rule of each
+group with its description.
 
 Exit codes: 0 no differences, 1 any error/warn finding, 2 fatal.
 

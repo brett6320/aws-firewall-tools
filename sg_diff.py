@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import html
 import ipaddress
 import json
 import logging
@@ -488,8 +489,113 @@ def print_report(groups: list[SG], rules, findings: list[Finding], summary: list
         print(f"\n({hidden} identical rule matches hidden; --show-identical to list)")
 
 
-def write_outputs(payload: dict, findings: list[Finding], json_path, csv_path) -> None:
-    for path in (json_path, csv_path):
+HTML_CSS = """
+:root { --bg:#fff; --fg:#1d2329; --muted:#5b6670; --line:#d9dee3; --card:#f6f8fa;
+  --error:#b42318; --error-bg:#fde8e7; --warn:#9a6700; --warn-bg:#fff4d6;
+  --info:#305d9c; --info-bg:#e6effa; --ok:#1a7f37; --ok-bg:#dcf5e3; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1418; --fg:#e3e8ec; --muted:#97a3ad; --line:#2c353d;
+  --card:#161d23; --error:#ff8a80; --error-bg:#3d1714; --warn:#f2c14e; --warn-bg:#3a2e0e;
+  --info:#8ab4f8; --info-bg:#14243b; --ok:#6fdc8c; --ok-bg:#12321e; } }
+body { background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",
+  Roboto,sans-serif; margin:0 auto; padding:24px 16px; max-width:1400px; }
+h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:18px; margin:32px 0 8px; }
+h3 { font-size:15px; margin:20px 0 6px; } .muted { color:var(--muted); }
+code, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; }
+table { border-collapse:collapse; width:100%; margin:6px 0 12px; }
+th, td { text-align:left; vertical-align:top; padding:6px 8px; border-bottom:1px solid var(--line); }
+th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+td ul { margin:0; padding-left:16px; } .wrap { overflow-x:auto; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 16px; margin:12px 0; }
+.badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; font-weight:600; }
+.error { color:var(--error); background:var(--error-bg); } .warn { color:var(--warn); background:var(--warn-bg); }
+.info { color:var(--info); background:var(--info-bg); } .ok { color:var(--ok); background:var(--ok-bg); }
+.stats span { margin-right:14px; } details > summary { cursor:pointer; color:var(--muted); margin:6px 0; }
+"""
+
+VERDICT_CLASS = {"identical": "ok", "equivalent": "warn", "differs": "error"}
+
+
+def render_html(payload: dict, generated: str) -> str:
+    e = html.escape
+
+    def ul(items):
+        return "<ul>" + "".join(f"<li class='mono'>{e(x)}</li>" for x in items) + "</ul>" if items else ""
+
+    def badge(text, cls):
+        return f"<span class='badge {cls}'>{e(text)}</span>"
+
+    def finding_rows(fs):
+        return "".join(
+            f"<tr><td>{badge(f['severity'], f['severity'])}</td><td class='mono'>{e(f['code'])}</td>"
+            f"<td class='mono'>{e(f['rule_id'])}<br>{e(f['rule'])}</td><td>{e(f['description'])}</td>"
+            f"<td>{ul(f['uncovered'])}</td><td>{ul(f['related'])}</td><td>{e(f['detail'])}</td></tr>"
+            for f in fs)
+
+    head = ("<tr><th>Severity</th><th>Code</th><th>Rule</th><th>Description</th><th>Uncovered</th>"
+            "<th>Other group's overlapping rules</th><th>Detail</th></tr>")
+    out = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+           f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+           f"<title>Security group diff</title><style>{HTML_CSS}</style></head><body>",
+           f"<h1>Security group diff</h1><div class='muted'>Account {e(payload['account'])} &middot; "
+           f"generated {e(generated)} &middot; descriptions shown for reference, not compared</div>"]
+
+    counts = payload["stats"]
+    out.append("<div class='card stats'>" + "".join(
+        f"<span><b>{e(k)}</b> {v}</span>" for k, v in sorted(counts.items())) + "</div>")
+
+    out.append("<h2>Groups</h2><div class='wrap'><table><tr><th>Role</th><th>Group</th><th>Name</th><th>VPC</th>"
+               "<th>Region</th><th>Ingress rules</th><th>Egress rules</th></tr>")
+    for i, g in enumerate(payload["groups"]):
+        rs = payload["rules"][g["group_id"]]
+        out.append(f"<tr><td>{'baseline' if i == 0 else 'compared'}</td><td class='mono'>{e(g['group_id'])}</td>"
+                   f"<td>{e(g['name'])}</td><td class='mono'>{e(g['vpc_id'])}</td><td>{e(g['region'])}</td>"
+                   f"<td>{sum(not r['egress'] for r in rs)}</td><td>{sum(r['egress'] for r in rs)}</td></tr>")
+    out.append("</table></div>")
+
+    general = [f for f in payload["findings"] if not f["baseline"]]
+    if general:
+        out.append("<div class='card'>" + "".join(
+            f"<div>{badge(f['severity'], f['severity'])} <span class='mono'>{e(f['code'])}</span> "
+            f"{e(f['detail'])}</div>" for f in general) + "</div>")
+
+    for row in payload["summary"]:
+        pair = (row["baseline"], row["other"])
+        out.append(f"<h2><span class='mono'>{e(pair[0])}</span> vs <span class='mono'>{e(pair[1])}</span></h2>"
+                   f"<div>ingress {badge(row['ingress'], VERDICT_CLASS[row['ingress']])} &nbsp; "
+                   f"egress {badge(row['egress'], VERDICT_CLASS[row['egress']])}</div>")
+        fs = [f for f in payload["findings"] if (f["baseline"], f["other"]) == pair]
+        for direction in ("ingress", "egress"):
+            for holder, against in (pair, pair[::-1]):
+                sel = [f for f in fs if f["direction"] == direction and f["group_id"] == holder]
+                if not sel:
+                    continue
+                diff = [f for f in sel if f["code"] != "IDENTICAL"]
+                same = [f for f in sel if f["code"] == "IDENTICAL"]
+                out.append(f"<h3>{direction}: rules in <span class='mono'>{e(holder)}</span> checked against "
+                           f"<span class='mono'>{e(against)}</span></h3>")
+                if diff:
+                    out.append(f"<div class='wrap'><table>{head}{finding_rows(diff)}</table></div>")
+                else:
+                    out.append("<div class='muted'>No differences.</div>")
+                if same:
+                    out.append(f"<details><summary>{len(same)} identical rule(s)</summary><div class='wrap'>"
+                               f"<table>{head}{finding_rows(same)}</table></div></details>")
+
+    out.append("<h2>All rules</h2>")
+    for g in payload["groups"]:
+        rs = payload["rules"][g["group_id"]]
+        out.append(f"<details><summary><span class='mono'>{e(g['group_id'])}</span> {e(g['name'])} "
+                   f"({len(rs)} rules)</summary><div class='wrap'><table><tr><th>Direction</th><th>Rule ID</th>"
+                   "<th>Rule</th><th>Description</th></tr>" + "".join(
+                       f"<tr><td>{'egress' if r['egress'] else 'ingress'}</td><td class='mono'>{e(r['rule_id'])}"
+                       f"</td><td class='mono'>{e(r['rule'])}</td><td>{e(r['description'])}</td></tr>" for r in rs)
+                   + "</table></div></details>")
+    out.append("</body></html>")
+    return "\n".join(out)
+
+
+def write_outputs(payload: dict, findings: list[Finding], json_path, csv_path, html_path=None) -> None:
+    for path in (json_path, csv_path, html_path):
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
     if json_path:
@@ -503,6 +609,10 @@ def write_outputs(payload: dict, findings: list[Finding], json_path, csv_path) -
             for f in findings:
                 w.writerow({**asdict(f), "uncovered": " | ".join(f.uncovered), "related": " | ".join(f.related)})
         log.info("Wrote %d rows to %s", len(findings), csv_path)
+    if html_path:
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(render_html(payload, dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        log.info("Wrote HTML to %s", html_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -527,6 +637,7 @@ def main() -> int:
     p.add_argument("--json", action="store_true", help="Emit JSON to stdout instead of text report")
     p.add_argument("--json-out", metavar="PATH", help="Write JSON report (overrides auto path)")
     p.add_argument("--csv-out", metavar="PATH", help="Write CSV report (overrides auto path)")
+    p.add_argument("--html-out", metavar="PATH", help="Write HTML report (overrides auto path)")
     p.add_argument("--out-dir", default=os.getenv("FMM_REPORT_DIR", "./reports"),
                    help="Base directory for auto-saved reports (default ./reports, env FMM_REPORT_DIR)")
     p.add_argument("--no-save", action="store_true", help="Do not auto-save reports")
@@ -576,16 +687,17 @@ def main() -> int:
         now = dt.datetime.now()
         slug = "_".join(g.group_id for g in groups)[:80]
         stem = Path(args.out_dir) / now.strftime("%Y-%m-%d") / f"{now.strftime('%H%M%S')}_sgdiff_{slug}"
-        paths = {"json": f"{stem}.json", "csv": f"{stem}.csv"}
+        paths = {"json": f"{stem}.json", "csv": f"{stem}.csv", "html": f"{stem}.html"}
     json_path = args.json_out or paths.get("json")
     csv_path = args.csv_out or paths.get("csv")
-    write_outputs(payload, findings, json_path, csv_path)
+    html_path = args.html_out or paths.get("html")
+    write_outputs(payload, findings, json_path, csv_path, html_path)
 
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
         print_report(groups, rules, findings, summary, args.show_identical)
-        saved = [x for x in (csv_path, json_path) if x]
+        saved = [x for x in (html_path, csv_path, json_path) if x]
         if saved:
             print("\nSaved:\n" + "\n".join(f"  {x}" for x in saved))
 
