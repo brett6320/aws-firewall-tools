@@ -59,6 +59,7 @@ def report_paths(args, tool: str, slug: str) -> dict[str, str | None]:
 
 
 def _mkparent(path) -> None:
+    """Create the parent directory of `path` if needed."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
