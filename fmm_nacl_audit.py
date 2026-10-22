@@ -82,10 +82,10 @@ import truststore
 truststore.inject_into_ssl()
 
 import boto3  # noqa: E402
-import botocore.session  # noqa: E402
 from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
 from lib import html_report  # noqa: E402
+from lib.accounts import DEFAULT_EXCLUDE_SUFFIXES, pick_profile, profile_lookup, resolve_admin_profile  # noqa: E402
 from lib.aws_common import _g, get_client, get_policy, get_session, list_policies, normalize_proto, resolve_regions
 
 log = logging.getLogger("fmm_nacl_audit")
@@ -96,7 +96,6 @@ LAST_RULE_MAX = 32766
 CUSTOM_RANGE = (5000, 32000)      # FMS guidance: custom rules live between these numbers
 DEFAULT_LIMIT = 30                # our raised rules-per-NACL quota, per direction (AWS default is 20)
 DEFAULT_HEADROOM = 3              # flag NACLs within this many rules of the limit
-DEFAULT_EXCLUDE_SUFFIXES = "-priv,-cpar"
 
 SEVERITY_ORDER = {"error": 0, "warn": 1, "info": 2}
 
@@ -287,65 +286,6 @@ def load_policy_file(path: str) -> tuple[dict, str | None]:
     if m:
         region = m.group(1)
     return (doc["Policy"] if "Policy" in doc else doc), region
-
-
-# --------------------------------------------------------------------------- #
-# Account -> local profile mapping
-# --------------------------------------------------------------------------- #
-_ACCOUNT_RE = re.compile(r"arn:aws[\w-]*:iam::(\d{12}):")
-
-
-def profile_account_map(exclude_suffixes: list[str]) -> dict[str, list[str]]:
-    """{account_id: [profile, ...]} from the local AWS config, skipping excluded suffixes.
-    Account id comes from sso_account_id, aws_account_id, or the role_arn's account."""
-    profiles = botocore.session.Session().full_config.get("profiles", {})
-    out: dict[str, list[str]] = {}
-    for name, cfg in sorted(profiles.items()):
-        if any(name.lower().endswith(s.lower()) for s in exclude_suffixes if s):
-            continue
-        acct = cfg.get("sso_account_id") or cfg.get("aws_account_id")
-        if not acct and cfg.get("role_arn"):
-            m = _ACCOUNT_RE.match(cfg["role_arn"])
-            acct = m.group(1) if m else None
-        if acct:
-            out.setdefault(str(acct).strip(), []).append(name)
-    return out
-
-
-def profile_lookup(args) -> tuple[dict[str, list[str]], dict[str, str]]:
-    """(account -> profiles map, --account-profile overrides) from CLI args."""
-    pmap = profile_account_map([s.strip() for s in args.exclude_profile_suffix.split(",")])
-    return pmap, dict(x.split("=", 1) for x in args.account_profile or [])
-
-
-def resolve_admin_profile(args) -> str | None:
-    """--profile wins; else the profile for --admin-account / FMM_ADMIN_ACCOUNT; else AWS_PROFILE.
-    A profile chosen by admin account is verified against that account before use."""
-    if args.profile:
-        return args.profile
-    if not args.admin_account:
-        return os.getenv("AWS_PROFILE") or None
-    profile, note = pick_profile(args.admin_account, *profile_lookup(args))
-    if not profile:
-        raise ValueError(f"no local AWS profile for FMS admin account {args.admin_account}")
-    if note and note != "override":
-        log.warning("Admin account %s: %s", args.admin_account, note)
-    actual = get_client("sts", boto3.Session(profile_name=profile)).get_caller_identity()["Account"]
-    if actual != args.admin_account:
-        raise ValueError(f"admin profile {profile} resolves to {actual}, expected {args.admin_account}")
-    log.info("FMS admin account %s via profile %s", args.admin_account, profile)
-    return profile
-
-
-def pick_profile(account: str, pmap: dict[str, list[str]], overrides: dict[str, str]) -> tuple[str | None, str]:
-    """Return (profile, note)."""
-    if account in overrides:
-        return overrides[account], "override"
-    cands = pmap.get(account, [])
-    if not cands:
-        return None, "no local profile"
-    note = "" if len(cands) == 1 else f"multiple profiles {cands}; using first (override with --account-profile)"
-    return cands[0], note
 
 
 # --------------------------------------------------------------------------- #
