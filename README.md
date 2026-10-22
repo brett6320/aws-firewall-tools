@@ -207,6 +207,154 @@ role(s) (`src`, `dst`, `any`) or blank for no match. Without `--show-all` only
 
 ---
 
+# fmm_nacl_drift — live NACLs vs Firewall Manager NACL policy
+
+Companion to `fmm_parity.py`. For each `NETWORK_ACL_COMMON` policy it asks FMS
+which member accounts are in scope (`fms:ListComplianceStatus`), reads the live
+network ACLs in each account through a **local AWS profile** for that account,
+and reports:
+
+- **First / last rule drift** — per direction, the lowest-numbered live entries
+  must equal the policy's `FirstEntries` and the highest-numbered (below the
+  `*` default) must equal `LastEntries`, in order. Compared fields: action,
+  protocol, CIDR, port range, ICMP type/code.
+- **Duplicate rules** — the same action / protocol / CIDR / ports / ICMP at
+  more than one rule number in a direction (`DUPLICATE_RULE`). Only the
+  lowest-numbered copy is ever evaluated; the rest waste slots against the limit.
+- **Default NACLs** — VPC default NACLs are never checked against the policy
+  (even with `--nacl-scope all`). Every default NACL in each scanned account
+  and region must hold only the `*` deny-all rules; anything else is
+  `DEFAULT_NACL_NOT_DENY_ALL`. The finding's `subnets` shows any subnets still
+  attached to it.
+- **Rule-count limit** — NACLs with `>= --limit` rules in a direction
+  (default 30, our raised quota; AWS default is 20), or within `--headroom` of it
+  (default 3, so 27+ rules is flagged). FMS
+  remediation temporarily adds rules, so headroom matters.
+
+Read-only. No mutating API calls.
+
+## Usage
+
+```bash
+# All NACL policies in a region, expected rules from the live FMS policy
+python fmm_nacl_drift.py --profile fms-admin --region us-east-1
+
+# Expected rules from a policy file; accounts still come from FMS
+aws fms get-policy --policy-id <id> --profile fms-admin > prod-nacl.json
+python fmm_nacl_drift.py --profile fms-admin --policy-file prod-nacl.json
+
+# Also diff the file against the live policy and check NACLs against both
+python fmm_nacl_drift.py --profile fms-admin --policy-file prod-nacl.json --compare-live
+
+# Flag only NACLs at the limit (no headroom)
+python fmm_nacl_drift.py --profile fms-admin --headroom 0
+```
+
+**Region.** FMS policies are regional; each policy's member accounts are
+scanned only in that policy's region. A policy file's `PolicyArn` sets the
+region (it wins over `--region`). Without one, the policy is looked up in every
+`--region` given (or `--all-regions`); not found, or found in more than one, is
+a fatal error. `--policy` that matches nothing in the scanned regions is also
+fatal rather than a clean pass.
+
+A policy file may be `aws fms get-policy` output, the bare `Policy` object, or
+a bare `NetworkAclEntrySet`. Rules are read from
+`SecurityServicePolicyData.PolicyOption.NetworkAclCommonPolicy.NetworkAclEntrySet`
+(`FirstEntries` / `LastEntries`); a policy with neither is a fatal error. The
+policy is located in FMS by `--policy`, else the file's `PolicyId` /
+`PolicyName`. Tag scope (`ResourceTags`) comes from the file when present,
+else from the live policy.
+
+## FMS administrator account
+
+Set the security account where Firewall Manager lives in `.env`:
+
+```bash
+FMM_ADMIN_ACCOUNT=123456789012
+```
+
+(or `--admin-account`). Its profile is found by account id the same way as
+member accounts below and verified with `sts:GetCallerIdentity`. Precedence:
+`--profile` > `FMM_ADMIN_ACCOUNT` / `--admin-account` > `AWS_PROFILE`.
+
+## Account → profile mapping
+
+Profiles are read from the local AWS config (`AWS_CONFIG_FILE` honoured). A
+profile's account is its `sso_account_id`, `aws_account_id`, or the account
+in its `role_arn`. Profiles ending in `-priv` or `-cpar` are never used
+(`--exclude-profile-suffix` to change). When several profiles match, the first
+alphabetically is used with a warning; force one with
+`--account-profile 123456789012=my-profile`. Each profile is verified with
+`sts:GetCallerIdentity` before use; a mismatch is reported, not scanned.
+Accounts with no profile are reported as `NO_PROFILE`.
+
+## Options
+
+| Flag | Description |
+|---|---|
+| `--admin-account ID` | FMS administrator (security) account; profile found by account id (env `FMM_ADMIN_ACCOUNT`) |
+| `--profile NAME` | FMS administrator profile; overrides `--admin-account` |
+| `--region` / `--all-regions` | As in `fmm_parity.py` |
+| `--policy ID_OR_NAME` | Restrict to one policy (also locates a policy file's policy) |
+| `--policy-file PATH` | Expected rules from this file instead of the live policy |
+| `--compare-live` | With `--policy-file`: report file vs live policy diffs, check NACLs against both |
+| `--account ID` | Restrict to account(s); repeatable / comma-separated |
+| `--account-profile ACCT=PROFILE` | Force the profile for an account (repeatable) |
+| `--exclude-profile-suffix LIST` | Profile suffixes never used (default `-priv,-cpar`) |
+| `--nacl-scope subnets\|fmmanaged\|all` | Non-default NACLs on subnets in the policy's tag scope (default), tagged `FMManaged=true`, or all non-default NACLs |
+| `--limit N` | Rules-per-direction limit (default 30, env `FMM_NACL_LIMIT`) |
+| `--headroom N` | Also flag NACLs within N rules of the limit (default 3, env `FMM_NACL_HEADROOM`) |
+| `--show-info` | Show info findings |
+| `--json`, `--json-out`, `--csv-out`, `--out-dir`, `--no-save` | As in `fmm_parity.py`; auto-saves `reports/YYYY-MM-DD/HHMMSS_nacl_<policy>.{html,json,csv}` |
+| `--html-out PATH` | Write the HTML report here (overrides auto path) |
+
+Exit code `1` on any error/warn finding, `2` on a fatal error, else `0`.
+
+## Findings
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `FIRST_MISSING` / `LAST_MISSING` | error | Too few entries in that direction to hold the block |
+| `FIRST_MISMATCH` / `LAST_MISMATCH` | error | Entry in that position differs; field diffs listed |
+| `FIRST_OUT_OF_ORDER` / `LAST_OUT_OF_ORDER` | error | Expected entry exists, but at another rule number |
+| `AT_LIMIT` / `NEAR_LIMIT` | warn | Rule count at the limit / within headroom |
+| `DEFAULT_NACL_NOT_DENY_ALL` | error | VPC default NACL has a rule other than `*` deny all |
+| `DUPLICATE_RULE` | warn | Identical rule at several rule numbers in one direction; `actual` gives the rule and its numbers |
+| `NOT_FMMANAGED` | warn | In-scope subnet's (non-default) NACL lacks `FMManaged=true` |
+| `POLICY_DRIFT` | warn/info | Policy file differs from live policy (`--compare-live`) |
+| `NO_PROFILE`, `PROFILE_ACCOUNT_MISMATCH`, `ACCOUNT_ERROR`, `FMS_ERROR` | error | Account or FMS could not be checked |
+| `FIRST_RENUMBERED` / `LAST_RENUMBERED` | info | Correct and in order, but not at FMS initial numbers (1.. / ..32766) |
+| `CUSTOM_OUTSIDE_RANGE` | info | Rule that matches no policy first/last rule (in any position) and is numbered outside the 5000–32000 custom range |
+
+`baseline` on each finding is `file`, `live`, or `file-vs-live`.
+
+## HTML report
+
+A single self-contained file (data embedded, no external assets, follows the
+system light/dark setting):
+
+- Run totals: policies, accounts scanned/skipped, NACLs checked, findings by severity.
+- Filters: free-text search plus dropdowns for severity, code, region, policy,
+  account, VPC, NACL, direction and baseline (each option shows its count).
+  Clicking a cell in one of those columns filters on it. Info findings are
+  hidden until "show info" is ticked.
+- Unique counts for the current filter: findings, accounts, regions, policies,
+  VPCs, NACLs, subnets, finding codes; and a per-code table with the same
+  unique counts.
+- Sortable findings table: click a header, shift-click for a secondary sort.
+- The filter and sort live in the URL fragment, so a filtered view can be
+  bookmarked or shared along with the file; "Download filtered CSV" exports
+  the rows currently shown.
+
+## IAM permissions
+
+FMS admin profile: `sts:GetCallerIdentity`, `fms:ListPolicies`, `fms:GetPolicy`,
+`fms:ListComplianceStatus`, `ec2:DescribeRegions` (for `--all-regions`).
+Member-account profiles: `sts:GetCallerIdentity`,
+`ec2:DescribeNetworkAcls`, `ec2:DescribeSubnets`.
+
+---
+
 # sg_diff
 
 Finds access granted by a **left** security group that the **right** security
