@@ -86,7 +86,7 @@ from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
 from lib import html_report  # noqa: E402
 from lib.accounts import DEFAULT_EXCLUDE_SUFFIXES, pick_profile, profile_lookup, resolve_admin_profile  # noqa: E402
-from lib.aws_common import _g, get_client, get_policy, get_session, list_policies, normalize_proto, resolve_regions
+from lib.aws_common import err_text, _g, get_client, get_policy, get_session, list_policies, normalize_proto, resolve_regions
 
 log = logging.getLogger("fmm_nacl_audit")
 
@@ -223,13 +223,6 @@ def _fmt_val(f: str, v) -> str:
     if f == "icmp":
         return f"type={v[0]},code={v[1]}"
     return str(v) or "-"
-
-
-def _err(e: Exception) -> str:
-    """Short error text for an AWS ClientError or any other exception."""
-    if isinstance(e, ClientError):
-        return f"{e.response['Error']['Code']}: {e.response['Error']['Message']}"
-    return f"{type(e).__name__}: {e}"
 
 
 # --------------------------------------------------------------------------- #
@@ -568,7 +561,7 @@ def build_jobs(args, regions: list[str], findings: list[Finding]) -> list[Job]:
             summaries = list(list_policies(fms))
         except ClientError as e:
             findings.append(Finding(severity="error", code="FMS_ERROR", region=region, policy_name="",
-                                    policy_id="", baseline="", detail=f"list_policies: {_err(e)}"))
+                                    policy_id="", baseline="", detail=f"list_policies: {err_text(e)}"))
             continue
         for s in summaries:
             if s.get("SecurityServiceType") != NACL_POLICY_TYPE:
@@ -602,7 +595,7 @@ def run(args, regions: list[str]) -> tuple[list[Finding], dict]:
             accounts = policy_accounts(fms, pid)
         except ClientError as e:
             findings.append(Finding(severity="error", code="FMS_ERROR", region=job.region, policy_name=pname,
-                                    policy_id=pid, baseline="", detail=f"list_compliance_status: {_err(e)}"))
+                                    policy_id=pid, baseline="", detail=f"list_compliance_status: {err_text(e)}"))
             continue
         if args.account:
             wanted = {a for item in args.account for a in item.split(",") if a}
@@ -623,7 +616,7 @@ def run(args, regions: list[str]) -> tuple[list[Finding], dict]:
             except (ClientError, BotoCoreError) as e:
                 stats["accounts_skipped"] += 1
                 findings.append(Finding(severity="error", code="ACCOUNT_ERROR", baseline="", **ctx,
-                                        detail=_err(e)))
+                                        detail=err_text(e)))
                 continue
             stats["accounts"] += 1
             stats["nacls"] += n
@@ -797,7 +790,7 @@ def main() -> int:
         log.error("%s", e)
         return 2
     except (ClientError, BotoCoreError) as e:
-        log.error("AWS error: %s", _err(e))
+        log.error("AWS error: %s", err_text(e))
         return 2
 
     paths = {}

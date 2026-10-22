@@ -18,6 +18,7 @@ from typing import Iterator
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -97,3 +98,10 @@ def resolve_regions(profile: str | None, region_args: list[str] | None, all_regi
     if not out:
         out = [x.strip() for x in os.getenv("AWS_REGION", "us-east-1").split(",") if x.strip()]
     return out
+
+
+def err_text(e: Exception) -> str:
+    """Short error text for an AWS ClientError ("Code: Message") or any other exception."""
+    if isinstance(e, ClientError):
+        return f"{e.response['Error']['Code']}: {e.response['Error']['Message']}"
+    return f"{type(e).__name__}: {e}"

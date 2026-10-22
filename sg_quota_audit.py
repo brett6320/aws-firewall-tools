@@ -74,7 +74,7 @@ from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
 from lib import html_report  # noqa: E402
 from lib.accounts import Target, add_account_args, check_profile_args, select_accounts  # noqa: E402
-from lib.aws_common import _g, get_client, get_session, resolve_regions  # noqa: E402  (loads .env, logging)
+from lib.aws_common import err_text, _g, get_client, get_session, resolve_regions  # noqa: E402  (loads .env, logging)
 from lib.output import (SEVERITY_BADGES, SEVERITY_ORDER, add_output_args, exit_code, print_saved,  # noqa: E402
                         report_paths, setup_logging, write_csv, write_json, write_text)
 
@@ -148,11 +148,6 @@ class GroupUsage:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _err(e: Exception) -> str:
-    """Short error text for an AWS ClientError or any other exception."""
-    if isinstance(e, ClientError):
-        return f"{e.response['Error']['Code']}: {e.response['Error']['Message']}"
-    return f"{type(e).__name__}: {e}"
 
 
 def _env_int(name: str, default: int | None) -> int | None:
@@ -212,7 +207,7 @@ def prefix_list_weights(ec2, ids: set[str]) -> tuple[dict[str, int], dict[str, s
             return list(_paginate(ec2, "describe_managed_prefix_lists", "PrefixLists", PrefixListIds=batch))
         except ClientError as e:
             if len(batch) == 1:
-                log.warning("describe_managed_prefix_lists %s: %s", batch[0], _err(e))
+                log.warning("describe_managed_prefix_lists %s: %s", batch[0], err_text(e))
                 return []
             return [pl for pid in batch for pl in describe([pid])]
 
@@ -357,7 +352,7 @@ def scan_region(t: Target, region: str, args) -> tuple[list[Finding], list[Group
                                         count=len(refs),
                                         detail="stale: " + ("; ".join(refs) if refs else "see console")))
         except ClientError as e:
-            log.warning("%s %s describe_stale_security_groups %s: %s", t.account, region, vpc_id, _err(e))
+            log.warning("%s %s describe_stale_security_groups %s: %s", t.account, region, vpc_id, err_text(e))
     return findings, list(groups.values()), quotas, len(enis)
 
 
@@ -384,7 +379,7 @@ def run(args, targets: list[Target], regions: list[str]) -> dict:
                 f, g, q, n = scan_region(t, region, args)
             except (ClientError, BotoCoreError) as e:
                 findings.append(Finding("error", "ACCOUNT_ERROR", account=t.account, profile=t.label,
-                                        region=region, detail=_err(e)))
+                                        region=region, detail=err_text(e)))
                 continue
             scanned = True
             findings += f
@@ -506,7 +501,7 @@ def main() -> int:
     add_account_args(p)
     p.add_argument("--region", action="append",
                    help="Region(s): repeatable and/or comma-separated. Default: AWS_REGION or us-east-1")
-    p.add_argument("--all-regions", action="store_true", help="Every enabled region that offers Firewall Manager (effectively all commercial regions)")
+    p.add_argument("--all-regions", action="store_true", help="Every enabled region")
     p.add_argument("--vpc", action="append", metavar="VPC_ID", help="Only these VPC(s) (repeatable)")
     p.add_argument("--rule-limit", type=int, default=_env_int("SG_RULE_LIMIT", None),
                    help="Rules-per-group quota to use instead of looking it up (env SG_RULE_LIMIT)")
@@ -528,13 +523,13 @@ def main() -> int:
     try:
         targets = select_accounts(args)
         regions = resolve_regions(next((t.profile for t in targets if t.ok), args.profile),
-                                  args.region, args.all_regions)
+                                  args.region, args.all_regions, service="ec2")
         payload = run(args, targets, regions)
     except ValueError as e:
         log.error("%s", e)
         return 2
     except (ClientError, BotoCoreError) as e:
-        log.error("AWS error: %s", _err(e))
+        log.error("AWS error: %s", err_text(e))
         return 2
 
     slug = "all-accounts" if args.all_accounts else "_".join(sorted({t.account for t in targets}))[:60]

@@ -76,7 +76,7 @@ from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
 from lib import html_report  # noqa: E402
 from lib.accounts import Target, add_account_args, check_profile_args, select_accounts  # noqa: E402
-from lib.aws_common import _g, get_client, get_session, resolve_regions  # noqa: E402  (also loads .env)
+from lib.aws_common import err_text, _g, get_client, get_session, resolve_regions  # noqa: E402  (also loads .env)
 from lib.output import (SEVERITY_BADGES, SEVERITY_ORDER, add_output_args, exit_code, print_saved,  # noqa: E402
                         report_paths, setup_logging, write_csv, write_json, write_text)
 
@@ -150,13 +150,6 @@ class Finding:
 CSV_COLUMNS = list(Finding.__dataclass_fields__)
 
 
-def _err(e: Exception) -> str:
-    """Short error text for an AWS ClientError or any other exception."""
-    if isinstance(e, ClientError):
-        return f"{e.response['Error']['Code']}: {e.response['Error']['Message']}"
-    return f"{type(e).__name__}: {e}"
-
-
 def _norm_cidr(s: str) -> str:
     """Canonical CIDR text; unparseable input is kept as is."""
     try:
@@ -213,7 +206,7 @@ def collect_region(target: Target, region: str, args) -> list[PrefixList]:
                 pl.entries += [{"cidr": _norm_cidr(e["Cidr"]), "description": e.get("Description", "")}
                                for e in _g(page, "Entries", [])]
         except ClientError as e:
-            pl.read_error = f"entries: {_err(e)}"
+            pl.read_error = f"entries: {err_text(e)}"
         try:
             assoc: list[dict] = []
             for page in ec2.get_paginator("get_managed_prefix_list_associations").paginate(
@@ -222,7 +215,7 @@ def collect_region(target: Target, region: str, args) -> list[PrefixList]:
             pl.associations = assoc
         except ClientError as e:
             # Typically AccessDenied for lists shared in from another account.
-            log.debug("%s %s associations: %s", region, pl.prefix_list_id, _err(e))
+            log.debug("%s %s associations: %s", region, pl.prefix_list_id, err_text(e))
             pl.associations = None
     log.info("Account %s %s: %d prefix lists", target.account, region, len(out))
     return out
@@ -367,7 +360,7 @@ def run(args, regions: list[str], targets: list[Target]) -> tuple[list[PrefixLis
                 scanned = True
             except (ClientError, BotoCoreError) as e:
                 findings.append(Finding("error", "ACCOUNT_ERROR", account=t.account, profile=t.label, region=region,
-                                        detail=f"describe_managed_prefix_lists: {_err(e)}"))
+                                        detail=f"describe_managed_prefix_lists: {err_text(e)}"))
         stats["accounts" if scanned else "accounts_skipped"] += 1
     for pl in dedupe_shared(lists):
         findings += check_list(pl, args.headroom, args.full_pct)
@@ -506,19 +499,19 @@ def main() -> int:
     check_profile_args(p, args)
 
     try:
-        regions = resolve_regions(args.profile, args.region, args.all_regions)
+        regions = resolve_regions(args.profile, args.region, args.all_regions, service="ec2")
         targets = select_accounts(args)
         lists, findings, stats = run(args, regions, targets)
     except ValueError as e:
         log.error("%s", e)
         return 2
     except (ClientError, BotoCoreError) as e:
-        log.error("AWS error: %s", _err(e))
+        log.error("AWS error: %s", err_text(e))
         return 2
 
     accounts = sorted({t.account for t in targets})
     slug = "_".join(accounts) if len(accounts) <= 3 else f"{len(accounts)}accounts"
-    paths = report_paths(args, TOOL, slug)
+    paths = report_paths(args, TOOL, f"pl_{slug}")
     data = payload(lists, findings, stats)
     if paths["json"]:
         write_json(paths["json"], data)

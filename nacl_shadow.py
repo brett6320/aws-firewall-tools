@@ -364,7 +364,7 @@ def main() -> int:
     add_account_args(p)
     p.add_argument("--region", action="append",
                    help="Region(s): repeatable and/or comma-separated. Default: AWS_REGION or us-east-1")
-    p.add_argument("--all-regions", action="store_true", help="Every enabled region (that offers Firewall Manager)")
+    p.add_argument("--all-regions", action="store_true", help="Every enabled region")
     p.add_argument("--vpc", action="append", metavar="VPC_ID", help="Only NACLs in these VPC(s) (repeatable)")
     p.add_argument("--nacl", action="append", metavar="ACL_ID", help="Only these NACL(s) (repeatable)")
     p.add_argument("--fmmanaged-only", action="store_true", help="Only NACLs tagged FMManaged=true")
@@ -377,7 +377,7 @@ def main() -> int:
     try:
         targets = select_accounts(args)
         regions = resolve_regions(next((t.profile for t in targets if t.ok), args.profile),
-                                  args.region, args.all_regions)
+                                  args.region, args.all_regions, service="ec2")
         findings, stats = run(args, targets, regions)
     except ValueError as e:
         log.error("%s", e)
@@ -388,7 +388,7 @@ def main() -> int:
 
     accounts = sorted({t.account for t in targets})
     slug = accounts[0] if len(accounts) == 1 else f"{len(accounts)}_accounts"
-    paths = report_paths(args, TOOL, slug)
+    paths = report_paths(args, TOOL, f"naclshadow_{slug}")
     payload = {"stats": stats, "findings": [asdict(f) for f in findings]}
     if paths["json"]:
         write_json(paths["json"], payload)

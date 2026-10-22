@@ -70,7 +70,7 @@ Worked example (ingress):
 | `--account-profile ACCT=PROFILE` | Force the profile for an account (repeatable) |
 | `--exclude-profile-suffix LIST` | Profile suffixes never used (default `-priv,-cpar`) |
 | `--region REGION` | Region(s): repeatable and/or comma-separated (default `AWS_REGION` or `us-east-1`) |
-| `--all-regions` | Every enabled region that offers Firewall Manager |
+| `--all-regions` | Every enabled region |
 | `--vpc VPC_ID` | Only NACLs in these VPC(s) (repeatable) |
 | `--nacl ACL_ID` | Only these NACL(s) (repeatable) |
 | `--fmmanaged-only` | Only NACLs tagged `FMManaged=true` |

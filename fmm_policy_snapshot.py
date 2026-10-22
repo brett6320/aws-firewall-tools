@@ -80,7 +80,7 @@ from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
 from lib import html_report  # noqa: E402
 from lib.accounts import add_profile_args, caller_account, check_profile_args, resolve_admin_profile  # noqa: E402
-from lib.aws_common import _g, get_client, get_session, list_policies, resolve_regions  # noqa: E402
+from lib.aws_common import err_text, _g, get_client, get_session, list_policies, resolve_regions  # noqa: E402
 from lib.output import (SEVERITY_BADGES, SEVERITY_ORDER, add_output_args, print_saved, report_paths,  # noqa: E402
                         setup_logging, slugify, write_csv, write_json, write_text)
 
@@ -139,11 +139,6 @@ CSV_COLUMNS = list(Finding.__dataclass_fields__)
 # --------------------------------------------------------------------------- #
 # Fetching live policies
 # --------------------------------------------------------------------------- #
-def _err(e: Exception) -> str:
-    """Short error text for an AWS ClientError or any other exception."""
-    if isinstance(e, ClientError):
-        return f"{e.response['Error']['Code']}: {e.response['Error']['Message']}"
-    return f"{type(e).__name__}: {e}"
 
 
 def fetch_live(profile: str | None, regions: list[str], policy_filter: str | None = None,
@@ -160,7 +155,7 @@ def fetch_live(profile: str | None, regions: list[str], policy_filter: str | Non
         try:
             summaries = list(list_policies(fms))
         except (ClientError, BotoCoreError) as e:
-            raise RuntimeError(f"{region}: list_policies failed: {_err(e)}") from e
+            raise RuntimeError(f"{region}: list_policies failed: {err_text(e)}") from e
         log.info("Region %s: %d policies", region, len(summaries))
         for s in summaries:
             if policy_filter and policy_filter not in (s["PolicyId"], s["PolicyName"]):
@@ -170,7 +165,7 @@ def fetch_live(profile: str | None, regions: list[str], policy_filter: str | Non
             try:
                 resp = fms.get_policy(PolicyId=s["PolicyId"])
             except (ClientError, BotoCoreError) as e:
-                raise RuntimeError(f"{region}: get_policy {s['PolicyId']} failed: {_err(e)}") from e
+                raise RuntimeError(f"{region}: get_policy {s['PolicyId']} failed: {err_text(e)}") from e
             arn = resp.get("PolicyArn") or s.get("PolicyArn", "")
             tags = None
             if with_tags and arn:
@@ -178,7 +173,7 @@ def fetch_live(profile: str | None, regions: list[str], policy_filter: str | Non
                     tags = {t["Key"]: t.get("Value", "")
                             for t in _g(fms.list_tags_for_resource(ResourceArn=arn), "TagList", [])}
                 except (ClientError, BotoCoreError) as e:
-                    log.warning("%s: list_tags_for_resource failed: %s", arn, _err(e))
+                    log.warning("%s: list_tags_for_resource failed: %s", arn, err_text(e))
             out.append(Record(region=region, policy=resp["Policy"], arn=arn, tags=tags))
     return out
 
@@ -638,7 +633,7 @@ def main() -> int:
         log.error("%s", e)
         return 2
     except (ClientError, BotoCoreError) as e:
-        log.error("AWS error: %s", _err(e))
+        log.error("AWS error: %s", err_text(e))
         return 2
 
 

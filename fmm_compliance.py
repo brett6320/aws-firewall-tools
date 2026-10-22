@@ -66,7 +66,7 @@ from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
 from lib import html_report  # noqa: E402
 from lib.accounts import add_profile_args, check_profile_args, resolve_admin_profile  # noqa: E402
-from lib.aws_common import _g, get_client, get_policy, get_session, list_policies, resolve_regions  # noqa: E402
+from lib.aws_common import err_text, _g, get_client, get_policy, get_session, list_policies, resolve_regions  # noqa: E402
 from lib.output import (SEVERITY_BADGES, SEVERITY_ORDER, add_output_args, exit_code, print_saved,  # noqa: E402
                         report_paths, setup_logging, write_csv, write_json, write_text)
 
@@ -135,13 +135,6 @@ class Finding:
 CSV_COLUMNS = list(Finding.__dataclass_fields__)
 
 
-def _err(e: Exception) -> str:
-    """Short error text for an AWS ClientError or any other exception."""
-    if isinstance(e, ClientError):
-        return f"{e.response['Error']['Code']}: {e.response['Error']['Message']}"
-    return f"{type(e).__name__}: {e}"
-
-
 def _ts(v) -> str:
     """Timestamp (datetime or string) as 'YYYY-MM-DD HH:MM:SS', or '' when absent."""
     if not v:
@@ -170,7 +163,7 @@ def org_account_names(profile: str | None) -> dict[str, str]:
         log.info("Organizations: %d account names", len(names))
         return names
     except (ClientError, BotoCoreError) as e:
-        log.warning("Organizations account names unavailable (%s); continuing without names", _err(e))
+        log.warning("Organizations account names unavailable (%s); continuing without names", err_text(e))
         return {}
 
 
@@ -185,7 +178,7 @@ def policy_info(fms, region: str, summary: dict, findings: list[Finding]) -> Pol
         pol = get_policy(fms, info.policy_id)
     except (ClientError, BotoCoreError) as e:
         findings.append(Finding("error", "FMS_ERROR", region, info.policy_name, info.policy_id, info.policy_type,
-                                detail=f"get_policy: {_err(e)} (settings from policy summary only)"))
+                                detail=f"get_policy: {err_text(e)} (settings from policy summary only)"))
         return info
     types = list(_g(pol, "ResourceTypeList", []))
     if pol.get("ResourceType") and pol["ResourceType"] not in types:
@@ -224,7 +217,7 @@ def scan_policy(fms, info: PolicyInfo, accounts_filter: set[str], names: dict[st
         for page in fms.get_paginator("list_compliance_status").paginate(PolicyId=info.policy_id):
             entries.extend(_g(page, "PolicyComplianceStatusList", []))
     except (ClientError, BotoCoreError) as e:
-        findings.append(Finding("error", "FMS_ERROR", **base, detail=f"list_compliance_status: {_err(e)}"))
+        findings.append(Finding("error", "FMS_ERROR", **base, detail=f"list_compliance_status: {err_text(e)}"))
         return
     for entry in sorted(entries, key=lambda x: x.get("MemberAccount", "")):
         account = entry.get("MemberAccount", "")
@@ -245,7 +238,7 @@ def scan_policy(fms, info: PolicyInfo, accounts_filter: set[str], names: dict[st
                 detail = fms.get_compliance_detail(PolicyId=info.policy_id,
                                                    MemberAccount=account)["PolicyComplianceDetail"]
             except (ClientError, BotoCoreError) as e:
-                findings.append(Finding("error", "FMS_ERROR", **acct, detail=f"get_compliance_detail: {_err(e)}"))
+                findings.append(Finding("error", "FMS_ERROR", **acct, detail=f"get_compliance_detail: {err_text(e)}"))
                 detail = None
             if detail is not None:
                 for v in _g(detail, "Violators", []):
@@ -290,7 +283,7 @@ def run(args, regions: list[str]) -> tuple[list[PolicyInfo], list[AccountRow], l
         try:
             summaries = list(list_policies(fms))
         except (ClientError, BotoCoreError) as e:
-            findings.append(Finding("error", "FMS_ERROR", region, detail=f"list_policies: {_err(e)}"))
+            findings.append(Finding("error", "FMS_ERROR", region, detail=f"list_policies: {err_text(e)}"))
             continue
         listed += 1
         for s in sorted(summaries, key=lambda x: x.get("PolicyName", "")):
@@ -473,7 +466,7 @@ def main() -> int:
         log.error("%s", e)
         return 2
     except (ClientError, BotoCoreError) as e:
-        log.error("AWS error: %s", _err(e))
+        log.error("AWS error: %s", err_text(e))
         return 2
 
     payload = {"stats": stats, "regions": regions,
@@ -481,7 +474,7 @@ def main() -> int:
                "accounts": [asdict(r) for r in rows],
                "violations": [asdict(f) for f in findings if f.code == "VIOLATION"],
                "issues": [asdict(f) for f in findings if f.code != "VIOLATION"]}
-    paths = report_paths(args, TOOL, args.policy or ",".join(sorted({t for t in args.type or []})) or "all")
+    paths = report_paths(args, TOOL, "compliance_" + (args.policy or ",".join(sorted({t for t in args.type or []})) or "all"))
     if paths["json"]:
         write_json(paths["json"], payload)
     if paths["csv"]:
