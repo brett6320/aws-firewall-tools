@@ -209,16 +209,20 @@ role(s) (`src`, `dst`, `any`) or blank for no match. Without `--show-all` only
 
 # sg_diff
 
-Compares the rules of two or more security groups in one account by the
-access they grant, not by how the rules are written. The first group is the
-baseline; each other group is compared against it in both directions, for
-ingress and egress separately. Descriptions are shown for reference but never
+Finds access granted by a **left** security group that the **right** security
+group(s) do not grant. With several right groups, the left group's access is
+checked against their combined access, as if they were all attached to the
+same ENI. A range split across two right groups therefore counts as granted.
+Access the right groups grant beyond the left is not reported. Ingress and
+egress are checked separately. Descriptions are shown for reference but never
 compared.
 
 ## Usage
 
 ```bash
+# LEFT RIGHT [RIGHT ...]
 python sg_diff.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210
+python sg_diff.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210 sg-0aaaabbbbccccdddd
 python sg_diff.py --profile prod-admin \
   arn:aws:ec2:us-east-1:111122223333:security-group/sg-0123456789abcdef0 \
   arn:aws:ec2:us-east-1:111122223333:security-group/sg-0fedcba9876543210
@@ -233,47 +237,47 @@ owners stop the run (exit 2).
 ## How rules are compared
 
 Each rule becomes a set of boxes: protocol × port range (or ICMP type/code) ×
-address range. Prefix lists are expanded to their current entries. A rule from
-one group is then checked against all rules of the other group in the same
+address range. Prefix lists are expanded to their current entries. Each left
+rule is then checked against all rules of all right groups in the same
 direction:
 
 | Code | Severity | Meaning |
 |---|---|---|
-| `MISSING` | error | Nothing in the other group overlaps this rule |
-| `PARTIAL` | error | The other group grants only part of it; `uncovered` lists the exact remainder (CIDRs, ports, ICMP types) |
-| `COVERED` | warn | The other group grants all of it through different rules (prefix list vs. its CIDRs, /16 vs. two /17s, a broader rule) |
-| `IDENTICAL` | info | Same protocol, ports and peer (hidden unless `--show-identical`) |
+| `MISSING` | error | Nothing in the right groups overlaps this left rule |
+| `PARTIAL` | error | The right groups grant only part of it |
+| `COVERED` | info | The right groups grant all of it through different rules (prefix list vs. its CIDRs, /16 vs. two /17s, a broader rule, pieces from several right groups) |
+| `IDENTICAL` | info | A right group has the same protocol, ports and peer |
 | `PREFIX_LIST_UNRESOLVED` | warn | Prefix list entries could not be read; rules using it are compared by id only |
 | `DIFFERENT_VPCS` | info | Groups are in different VPCs, so group references may not be comparable |
 
-Every finding lists the overlapping rules from the other group, with their
-descriptions. A broader rule on one side shows as `COVERED` on the narrow side
-and `PARTIAL` on the broad side. Security group references match by group id;
-a self-reference matches the other group's self-reference. IPv4 and IPv6 are
+For `MISSING` and `PARTIAL`, `uncovered` is the exact access that is absent
+(merged CIDRs, ports, ICMP types). Every finding lists the overlapping right
+rules (group, rule id, rule, description). `COVERED` and `IDENTICAL` are hidden
+unless `--show-covered`. Security group references match by group id; a left
+self-reference matches a self-reference in any right group. IPv4 and IPv6 are
 separate spaces.
 
-Each pair gets a per-direction verdict: `identical`, `equivalent` (same access,
-different rules) or `differs`.
+Each direction gets a verdict: `N gap(s)`, `covered` or `identical`.
 
 ## Options
 
 | Option | Description |
 |---|---|
-| `SG ...` | Group ARNs or ids; first is the baseline |
+| `SG ...` | Group ARNs or ids: `LEFT RIGHT [RIGHT ...]` |
 | `--profile` | AWS profile (default `AWS_PROFILE`) |
 | `--region` | Region for bare ids |
-| `--show-identical` | Also list exact matches |
+| `--show-covered` | Also list left rules fully granted by the right groups |
 | `--json` / `--json-out` / `--csv-out` | Output, as for the other tools |
 | `--html-out` | Write the HTML report here (overrides auto path) |
 | `--out-dir` / `--no-save` | Auto-saved reports under `reports/YYYY-MM-DD/HHMMSS_sgdiff_<ids>.{html,csv,json}` |
 
 The HTML report is a single self-contained file (no external assets, follows
-the system light/dark setting): finding counts, the groups, per-pair verdicts,
-a findings table per direction and side with uncovered remainders and the other
-group's overlapping rules (identical matches collapsed), and every rule of each
-group with its description.
+the system light/dark setting): finding counts, the groups, per-direction
+verdicts, a gaps table per direction with the absent access and overlapping
+right rules (fully granted left rules collapsed), and every rule of each group
+with its description.
 
-Exit codes: 0 no differences, 1 any error/warn finding, 2 fatal.
+Exit codes: 0 no gaps, 1 any gap or warning, 2 fatal.
 
 ## IAM permissions
 

@@ -2,25 +2,28 @@
 """
 Security group rule diff.
 
-Compares the rules of two or more security groups in one account, given as
-ARNs or group IDs. The first group is the baseline; every other group is
-compared against it in both directions, for ingress and egress separately.
+Finds access granted by a "left" security group that the "right" security
+group(s) do not grant. Groups are given as ARNs or group IDs, all in one
+account; the first is the left group and every further group is a right
+group. With several right groups, left access is checked against their
+combined access (as if all were attached to the same ENI), so a range split
+across two right groups counts as granted. Ingress and egress are checked
+separately. Access the right groups grant beyond the left is not reported.
 
 Rules are compared by the access they grant, not by how they are written:
 
   * each rule becomes a set of (protocol x port/ICMP range x address range)
     boxes; prefix lists are expanded to their current CIDR entries
-  * a rule is IDENTICAL when the other group has the same rule
+  * a left rule is MISSING when nothing in the right groups overlaps it
+  * PARTIAL when the right groups grant only part of it
+  * for both, `uncovered` is the exact absent access (CIDRs, ports, ICMP)
+  * COVERED (info) when the right groups grant all of it through different
+    rules (a prefix list vs. its CIDRs, a /16 vs. two /17s, a broader rule)
+  * IDENTICAL (info) when a right group has the same rule
     (protocol, ports and peer; descriptions are ignored)
-  * COVERED when the other group grants all of the same access through
-    different rules (e.g. a prefix list vs. its CIDRs, or a /16 vs. two /17s,
-    or a broader rule)
-  * PARTIAL when the other group grants only part of it; the uncovered
-    remainder is reported as exact CIDRs / ports
-  * MISSING when nothing in the other group overlaps it
 
-Security group references are matched by group ID (a self-reference matches
-the other group's self-reference). Prefix lists that cannot be read are
+Security group references are matched by group ID (a self-reference in the
+left group matches a self-reference in any right group). Prefix lists that cannot be read are
 compared by ID only and reported. Descriptions are shown for reference only.
 
 Configuration (.env, all optional; CLI flags override):
@@ -270,7 +273,7 @@ class SgRule:
 
     def ref(self) -> str:
         d = f' "{self.description}"' if self.description else ""
-        return f"{self.rule_id} {self}{d}"
+        return f"{self.group_id} {self.rule_id} {self}{d}"
 
 
 # --------------------------------------------------------------------------- #
@@ -280,12 +283,10 @@ class SgRule:
 class Finding:
     severity: str            # error | warn | info
     code: str
-    baseline: str = ""
-    other: str = ""
+    left: str = ""
+    right: str = ""          # right group ids, comma-separated
     direction: str = ""
-    group_id: str = ""       # group that holds the rule
-    compared_to: str = ""    # group it was checked against
-    rule_id: str = ""
+    rule_id: str = ""        # left rule
     rule: str = ""
     description: str = ""
     uncovered: list[str] = field(default_factory=list)
@@ -306,12 +307,14 @@ def fmt_remainder(rem: dict[str, list[Box]], egress: bool) -> list[str]:
             for (pr, ports), addrs in sorted(by_pp.items())]
 
 
-def compare_rules(rules: list[SgRule], others: list[SgRule], holder: SG, against: SG, pair: tuple[str, str],
+def compare_rules(rules: list[SgRule], others: list[SgRule], left: SG, rights: list[SG],
                   direction: str) -> list[Finding]:
+    """Check each left rule's access against the combined access of the right groups' rules (`others`)."""
     out = []
+    right_ids = ", ".join(g.group_id for g in rights)
     for r in rules:
-        base = dict(baseline=pair[0], other=pair[1], direction=direction, group_id=holder.group_id,
-                    compared_to=against.group_id, rule_id=r.rule_id, rule=str(r), description=r.description)
+        base = dict(left=left.group_id, right=right_ids, direction=direction, rule_id=r.rule_id, rule=str(r),
+                    description=r.description)
         same = [o for o in others if o.key() == r.key()]
         if same:
             out.append(Finding("info", "IDENTICAL", related=[o.ref() for o in same], **base))
@@ -331,34 +334,30 @@ def compare_rules(rules: list[SgRule], others: list[SgRule], holder: SG, against
         if not overlapping:
             note = "; prefix list unresolved, compared by id only" if r.peer_kind == "pl" and \
                 r.boxes[0][0].startswith("pl:") else ""
-            out.append(Finding("error", "MISSING", detail=f"nothing in {against.group_id} grants any of this{note}",
-                               **base))
+            out.append(Finding("error", "MISSING", uncovered=fmt_remainder(rem, r.egress),
+                               detail=f"nothing in {right_ids} grants any of this{note}", **base))
         elif not rem:
-            out.append(Finding("warn", "COVERED", related=related,
-                               detail=f"fully granted by different rule(s) in {against.group_id}", **base))
+            out.append(Finding("info", "COVERED", related=related,
+                               detail=f"fully granted by different rule(s) in {right_ids}", **base))
         else:
             out.append(Finding("error", "PARTIAL", uncovered=fmt_remainder(rem, r.egress), related=related,
-                               detail=f"{against.group_id} grants only part of this", **base))
-    return sorted(out, key=lambda f: SEVERITY_ORDER[f.severity])
+                               detail=f"only partly granted by {right_ids}", **base))
+    return sorted(out, key=lambda f: (SEVERITY_ORDER[f.severity], f.code != "MISSING"))
 
 
 def diff_groups(groups: list[SG], rules: dict[str, list[SgRule]]) -> tuple[list[Finding], list[dict]]:
-    findings, summary = [], []
-    base = groups[0]
-    for other in groups[1:]:
-        pair = (base.group_id, other.group_id)
-        row = {"baseline": base.group_id, "other": other.group_id}
-        for egress, direction in ((False, "ingress"), (True, "egress")):
-            a = [r for r in rules[base.group_id] if r.egress == egress]
-            b = [r for r in rules[other.group_id] if r.egress == egress]
-            fs = (compare_rules(a, b, base, other, pair, direction)
-                  + compare_rules(b, a, other, base, pair, direction))
-            codes = {f.code for f in fs}
-            row[direction] = ("differs" if codes & {"MISSING", "PARTIAL"}
-                              else "equivalent" if "COVERED" in codes else "identical")
-            findings.extend(fs)
-        summary.append(row)
-    return findings, summary
+    left, rights = groups[0], groups[1:]
+    findings = []
+    row = {"left": left.group_id, "right": ", ".join(g.group_id for g in rights)}
+    for egress, direction in ((False, "ingress"), (True, "egress")):
+        a = [r for r in rules[left.group_id] if r.egress == egress]
+        b = [r for g in rights for r in rules[g.group_id] if r.egress == egress]
+        fs = compare_rules(a, b, left, rights, direction)
+        gaps = sum(f.code in ("MISSING", "PARTIAL") for f in fs)
+        row[direction] = (f"{gaps} gap(s)" if gaps
+                          else "covered" if any(f.code == "COVERED" for f in fs) else "identical")
+        findings.extend(fs)
+    return findings, [row]
 
 
 # --------------------------------------------------------------------------- #
@@ -453,22 +452,23 @@ def load(session_factory, targets: list[tuple[str, str]]):
 # --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
-def print_report(groups: list[SG], rules, findings: list[Finding], summary: list[dict], show_identical: bool) -> None:
+def print_report(groups: list[SG], rules, findings: list[Finding], summary: list[dict], show_covered: bool) -> None:
     print()
     for i, g in enumerate(groups):
-        print(f"{'baseline' if i == 0 else 'other   '}  {g}  rules: "
+        print(f"{'left ' if i == 0 else 'right'}  {g}  rules: "
               f"{sum(not r.egress for r in rules[g.group_id])} in / {sum(r.egress for r in rules[g.group_id])} out")
-    for f in (f for f in findings if not f.baseline):
+    for f in (f for f in findings if not f.left):
         print(f"[{f.severity.upper():<5}] {f.code} {f.detail}")
     for row in summary:
-        print(f"\n=== {row['baseline']} vs {row['other']}   ingress: {row['ingress']}   egress: {row['egress']}")
-        shown = [f for f in findings if (f.baseline, f.other) == (row["baseline"], row["other"])
-                 and (show_identical or f.code != "IDENTICAL")]
+        print(f"\n=== access in {row['left']} absent from {row['right']}   "
+              f"ingress: {row['ingress']}   egress: {row['egress']}")
+        shown = [f for f in findings if (f.left, f.right) == (row["left"], row["right"])
+                 and (show_covered or f.severity != "info")]
         cur = None
         for f in shown:
-            if (f.direction, f.group_id) != cur:
-                cur = (f.direction, f.group_id)
-                print(f"\n  {f.direction}: rules in {f.group_id} checked against {f.compared_to}")
+            if f.direction != cur:
+                cur = f.direction
+                print(f"\n  {f.direction}:")
             desc = f'  "{f.description}"' if f.description else ""
             print(f"    [{f.severity.upper():<5}] {f.code:<9} {f.rule_id} {f.rule}{desc}")
             if f.detail:
@@ -483,10 +483,10 @@ def print_report(groups: list[SG], rules, findings: list[Finding], summary: list
             for x in f.related:
                 print(f"            {'matches' if f.code == 'IDENTICAL' else 'overlaps'}: {x}")
         if not shown:
-            print("  (no differences)")
-    hidden = sum(f.code == "IDENTICAL" for f in findings)
-    if hidden and not show_identical:
-        print(f"\n({hidden} identical rule matches hidden; --show-identical to list)")
+            print(f"  (no gaps: {row['right']} grant(s) everything {row['left']} grants)")
+    hidden = sum(f.code in ("COVERED", "IDENTICAL") for f in findings)
+    if hidden and not show_covered:
+        print(f"\n({hidden} left rules fully granted by the right group(s) hidden; --show-covered to list)")
 
 
 HTML_CSS = """
@@ -512,7 +512,8 @@ td ul { margin:0; padding-left:16px; } .wrap { overflow-x:auto; }
 .stats span { margin-right:14px; } details > summary { cursor:pointer; color:var(--muted); margin:6px 0; }
 """
 
-VERDICT_CLASS = {"identical": "ok", "equivalent": "warn", "differs": "error"}
+def verdict_class(v: str) -> str:
+    return "error" if "gap" in v else "ok"
 
 
 def render_html(payload: dict, generated: str) -> str:
@@ -531,13 +532,14 @@ def render_html(payload: dict, generated: str) -> str:
             f"<td>{ul(f['uncovered'])}</td><td>{ul(f['related'])}</td><td>{e(f['detail'])}</td></tr>"
             for f in fs)
 
-    head = ("<tr><th>Severity</th><th>Code</th><th>Rule</th><th>Description</th><th>Uncovered</th>"
-            "<th>Other group's overlapping rules</th><th>Detail</th></tr>")
+    head = ("<tr><th>Severity</th><th>Code</th><th>Left rule</th><th>Description</th><th>Absent from right</th>"
+            "<th>Overlapping right rules</th><th>Detail</th></tr>")
     out = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
            f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
            f"<title>Security group diff</title><style>{HTML_CSS}</style></head><body>",
            f"<h1>Security group diff</h1><div class='muted'>Account {e(payload['account'])} &middot; "
-           f"generated {e(generated)} &middot; descriptions shown for reference, not compared</div>"]
+           f"generated {e(generated)} &middot; access granted by the left group that the right group(s) combined do not grant "
+           f"&middot; descriptions shown for reference, not compared</div>"]
 
     counts = payload["stats"]
     out.append("<div class='card stats'>" + "".join(
@@ -547,39 +549,36 @@ def render_html(payload: dict, generated: str) -> str:
                "<th>Region</th><th>Ingress rules</th><th>Egress rules</th></tr>")
     for i, g in enumerate(payload["groups"]):
         rs = payload["rules"][g["group_id"]]
-        out.append(f"<tr><td>{'baseline' if i == 0 else 'compared'}</td><td class='mono'>{e(g['group_id'])}</td>"
+        out.append(f"<tr><td>{'left' if i == 0 else 'right'}</td><td class='mono'>{e(g['group_id'])}</td>"
                    f"<td>{e(g['name'])}</td><td class='mono'>{e(g['vpc_id'])}</td><td>{e(g['region'])}</td>"
                    f"<td>{sum(not r['egress'] for r in rs)}</td><td>{sum(r['egress'] for r in rs)}</td></tr>")
     out.append("</table></div>")
 
-    general = [f for f in payload["findings"] if not f["baseline"]]
+    general = [f for f in payload["findings"] if not f["left"]]
     if general:
         out.append("<div class='card'>" + "".join(
             f"<div>{badge(f['severity'], f['severity'])} <span class='mono'>{e(f['code'])}</span> "
             f"{e(f['detail'])}</div>" for f in general) + "</div>")
 
     for row in payload["summary"]:
-        pair = (row["baseline"], row["other"])
-        out.append(f"<h2><span class='mono'>{e(pair[0])}</span> vs <span class='mono'>{e(pair[1])}</span></h2>"
-                   f"<div>ingress {badge(row['ingress'], VERDICT_CLASS[row['ingress']])} &nbsp; "
-                   f"egress {badge(row['egress'], VERDICT_CLASS[row['egress']])}</div>")
-        fs = [f for f in payload["findings"] if (f["baseline"], f["other"]) == pair]
+        pair = (row["left"], row["right"])
+        out.append(f"<h2>Access in <span class='mono'>{e(pair[0])}</span> absent from "
+                   f"<span class='mono'>{e(pair[1])}</span></h2>"
+                   f"<div>ingress {badge(row['ingress'], verdict_class(row['ingress']))} &nbsp; "
+                   f"egress {badge(row['egress'], verdict_class(row['egress']))}</div>")
+        fs = [f for f in payload["findings"] if (f["left"], f["right"]) == pair]
         for direction in ("ingress", "egress"):
-            for holder, against in (pair, pair[::-1]):
-                sel = [f for f in fs if f["direction"] == direction and f["group_id"] == holder]
-                if not sel:
-                    continue
-                diff = [f for f in sel if f["code"] != "IDENTICAL"]
-                same = [f for f in sel if f["code"] == "IDENTICAL"]
-                out.append(f"<h3>{direction}: rules in <span class='mono'>{e(holder)}</span> checked against "
-                           f"<span class='mono'>{e(against)}</span></h3>")
-                if diff:
-                    out.append(f"<div class='wrap'><table>{head}{finding_rows(diff)}</table></div>")
-                else:
-                    out.append("<div class='muted'>No differences.</div>")
-                if same:
-                    out.append(f"<details><summary>{len(same)} identical rule(s)</summary><div class='wrap'>"
-                               f"<table>{head}{finding_rows(same)}</table></div></details>")
+            sel = [f for f in fs if f["direction"] == direction]
+            gaps = [f for f in sel if f["severity"] != "info"]
+            ok = [f for f in sel if f["severity"] == "info"]
+            out.append(f"<h3>{direction}</h3>")
+            if gaps:
+                out.append(f"<div class='wrap'><table>{head}{finding_rows(gaps)}</table></div>")
+            else:
+                out.append("<div class='muted'>No gaps.</div>")
+            if ok:
+                out.append(f"<details><summary>{len(ok)} left rule(s) fully granted by the right group(s)</summary>"
+                           f"<div class='wrap'><table>{head}{finding_rows(ok)}</table></div></details>")
 
     out.append("<h2>All rules</h2>")
     for g in payload["groups"]:
@@ -620,8 +619,8 @@ def write_outputs(payload: dict, findings: list[Finding], json_path, csv_path, h
 # --------------------------------------------------------------------------- #
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Compare security group rules by the access they grant (prefix lists expanded, "
-                    "overlapping CIDRs resolved). First group is the baseline.",
+        description="Find access granted by the left security group that the right group(s), combined, do not grant "
+                    "(prefix lists expanded, overlapping CIDRs resolved).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   %(prog)s --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210
@@ -629,11 +628,13 @@ def main() -> int:
            arn:aws:ec2:us-west-2:111122223333:security-group/sg-0fedcba9876543210
 """)
     p.add_argument("groups", nargs="+", metavar="SG",
-                   help="Security group ARNs or ids (comma-separated also accepted); first is the baseline")
+                   help="Security group ARNs or ids (comma-separated also accepted): LEFT RIGHT [RIGHT ...]; "
+                        "left access is checked against the right groups' combined access")
     p.add_argument("--profile", default=os.getenv("AWS_PROFILE") or None, help="AWS profile (default AWS_PROFILE)")
     p.add_argument("--region", default=os.getenv("AWS_REGION") or None,
                    help="Region for bare group ids (default AWS_REGION, then the profile's region)")
-    p.add_argument("--show-identical", action="store_true", help="Also list rules that match exactly")
+    p.add_argument("--show-covered", action="store_true",
+                   help="Also list left rules the right group fully grants (COVERED, IDENTICAL)")
     p.add_argument("--json", action="store_true", help="Emit JSON to stdout instead of text report")
     p.add_argument("--json-out", metavar="PATH", help="Write JSON report (overrides auto path)")
     p.add_argument("--csv-out", metavar="PATH", help="Write CSV report (overrides auto path)")
@@ -696,7 +697,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        print_report(groups, rules, findings, summary, args.show_identical)
+        print_report(groups, rules, findings, summary, args.show_covered)
         saved = [x for x in (html_path, csv_path, json_path) if x]
         if saved:
             print("\nSaved:\n" + "\n".join(f"  {x}" for x in saved))
