@@ -18,6 +18,7 @@ from typing import Iterator
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -72,15 +73,21 @@ def get_policy(fms, policy_id: str) -> dict:
     return fms.get_policy(PolicyId=policy_id)["Policy"]
 
 
-def resolve_regions(profile: str | None, region_args: list[str] | None, all_regions: bool) -> list[str]:
-    """--region is repeatable and comma-separable; --all-regions enumerates enabled regions that have FMS."""
+def resolve_regions(profile: str | None, region_args: list[str] | None, all_regions: bool,
+                    service: str = "fms") -> list[str]:
+    """Regions to scan.
+
+    --region is repeatable and comma-separable (default AWS_REGION, else us-east-1).
+    --all-regions enumerates the account's enabled regions that offer `service`:
+    "fms" for Firewall Manager tools, "ec2" for tools that only read EC2/VPC resources.
+    """
     if all_regions:
         session = get_session(profile, os.getenv("AWS_REGION", "us-east-1"))
         enabled = {r["RegionName"] for r in get_client("ec2", session).describe_regions(
             Filters=[{"Name": "opt-in-status", "Values": ["opt-in-not-required", "opted-in"]}])["Regions"]}
-        fms_regions = set(session.get_available_regions("fms"))
-        regions = sorted(enabled & fms_regions)
-        log.info("--all-regions: %d regions with Firewall Manager: %s", len(regions), ", ".join(regions))
+        offered = set(session.get_available_regions(service))
+        regions = sorted(enabled & offered)
+        log.info("--all-regions: %d enabled regions offering %s: %s", len(regions), service, ", ".join(regions))
         return regions
     out: list[str] = []
     for item in region_args or []:
@@ -91,3 +98,10 @@ def resolve_regions(profile: str | None, region_args: list[str] | None, all_regi
     if not out:
         out = [x.strip() for x in os.getenv("AWS_REGION", "us-east-1").split(",") if x.strip()]
     return out
+
+
+def err_text(e: Exception) -> str:
+    """Short error text for an AWS ClientError ("Code: Message") or any other exception."""
+    if isinstance(e, ClientError):
+        return f"{e.response['Error']['Code']}: {e.response['Error']['Message']}"
+    return f"{type(e).__name__}: {e}"
