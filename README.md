@@ -352,3 +352,83 @@ FMS admin profile: `sts:GetCallerIdentity`, `fms:ListPolicies`, `fms:GetPolicy`,
 `fms:ListComplianceStatus`, `ec2:DescribeRegions` (for `--all-regions`).
 Member-account profiles: `sts:GetCallerIdentity`,
 `ec2:DescribeNetworkAcls`, `ec2:DescribeSubnets`.
+
+---
+
+# sg_diff
+
+Finds access granted by a **left** security group that the **right** security
+group(s) do not grant. With several right groups, the left group's access is
+checked against their combined access, as if they were all attached to the
+same ENI. A range split across two right groups therefore counts as granted.
+Access the right groups grant beyond the left is not reported. Ingress and
+egress are checked separately. Descriptions are shown for reference but never
+compared.
+
+## Usage
+
+```bash
+# LEFT RIGHT [RIGHT ...]
+python sg_diff.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210
+python sg_diff.py --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210 sg-0aaaabbbbccccdddd
+python sg_diff.py --profile prod-admin \
+  arn:aws:ec2:us-east-1:111122223333:security-group/sg-0123456789abcdef0 \
+  arn:aws:ec2:us-east-1:111122223333:security-group/sg-0fedcba9876543210
+```
+
+Groups may be ARNs or ids (mixed is fine). ARNs carry their region; bare ids
+use `--region`, then `AWS_REGION`, then the profile's region. All groups must
+be in one account: ARNs naming different accounts, a profile whose account
+(`sts:GetCallerIdentity`) differs from the ARNs, or groups with different
+owners stop the run (exit 2).
+
+## How rules are compared
+
+Each rule becomes a set of boxes: protocol × port range (or ICMP type/code) ×
+address range. Prefix lists are expanded to their current entries. Each left
+rule is then checked against all rules of all right groups in the same
+direction:
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `MISSING` | error | Nothing in the right groups overlaps this left rule |
+| `PARTIAL` | error | The right groups grant only part of it |
+| `COVERED` | info | The right groups grant all of it through different rules (prefix list vs. its CIDRs, /16 vs. two /17s, a broader rule, pieces from several right groups) |
+| `IDENTICAL` | info | A right group has the same protocol, ports and peer |
+| `PREFIX_LIST_UNRESOLVED` | warn | Prefix list entries could not be read; rules using it are compared by id only |
+| `DIFFERENT_VPCS` | info | Groups are in different VPCs, so group references may not be comparable |
+
+For `MISSING` and `PARTIAL`, `uncovered` is the exact access that is absent
+(merged CIDRs, ports, ICMP types). Every finding lists the overlapping right
+rules (group, rule id, rule, description). `COVERED` and `IDENTICAL` are hidden
+unless `--show-covered`. Security group references match by group id; a left
+self-reference matches a self-reference in any right group. IPv4 and IPv6 are
+separate spaces.
+
+Each direction gets a verdict: `N gap(s)`, `covered` or `identical`.
+
+## Options
+
+| Option | Description |
+|---|---|
+| `SG ...` | Group ARNs or ids: `LEFT RIGHT [RIGHT ...]` |
+| `--profile` | AWS profile (default `AWS_PROFILE`) |
+| `--region` | Region for bare ids |
+| `--show-covered` | Also list left rules fully granted by the right groups |
+| `--json` / `--json-out` / `--csv-out` | Output, as for the other tools |
+| `--html-out` | Write the HTML report here (overrides auto path) |
+| `--out-dir` / `--no-save` | Auto-saved reports under `reports/YYYY-MM-DD/HHMMSS_sgdiff_<ids>.{html,csv,json}` |
+
+The HTML report is a single self-contained file (no external assets, follows
+the system light/dark setting): finding counts, the groups, per-direction
+verdicts, a gaps table per direction with the absent access and overlapping
+right rules (fully granted left rules collapsed), and every rule of each group
+with its description.
+
+Exit codes: 0 no gaps, 1 any gap or warning, 2 fatal.
+
+## IAM permissions
+
+`ec2:DescribeSecurityGroups`, `ec2:DescribeSecurityGroupRules`,
+`ec2:DescribeManagedPrefixLists`, `ec2:GetManagedPrefixListEntries`,
+`sts:GetCallerIdentity`.
