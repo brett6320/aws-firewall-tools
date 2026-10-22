@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-Security group rule diff.
+Security group access gap check.
+
+Intent: before replacing or consolidating security groups (moving workloads
+from a legacy group to new ones, or checking that a standard group covers a
+bespoke one), confirm that nothing the old group allowed is lost. Rules are
+compared by the access they actually grant, so differences in how rules are
+written (prefix lists vs. CIDRs, split or merged ranges) are not reported as
+gaps, while real missing access is reported down to the exact CIDRs and ports.
 
 Finds access granted by a "left" security group that the "right" security
 group(s) do not grant. Groups are given as ARNs or group IDs, all in one
@@ -23,8 +30,9 @@ Rules are compared by the access they grant, not by how they are written:
     (protocol, ports and peer; descriptions are ignored)
 
 Security group references are matched by group ID (a self-reference in the
-left group matches a self-reference in any right group). Prefix lists that cannot be read are
-compared by ID only and reported. Descriptions are shown for reference only.
+left group matches a self-reference in any right group). Prefix lists that
+cannot be read are compared by ID only and reported. Descriptions are shown
+for reference only.
 
 Configuration (.env, all optional; CLI flags override):
 
@@ -32,8 +40,17 @@ Configuration (.env, all optional; CLI flags override):
     AWS_PROFILE=
     # Region for bare group IDs when --region not given (ARNs carry their own)
     AWS_REGION=us-east-1
-    # Base directory for auto-saved reports (<dir>/YYYY-MM-DD/...)
+    # Base directory for auto-saved reports (<dir>/<tool>/YYYY-MM-DD/...)
     FMM_REPORT_DIR=./reports
+
+Reports: text on screen, plus auto-saved HTML, CSV and JSON under
+reports/sg_access_gap/YYYY-MM-DD/.
+
+Usage:
+
+    ./sg_access_gap.py --profile prod-admin LEFT_SG RIGHT_SG [RIGHT_SG ...]
+
+Exit codes: 0 no gaps, 1 gaps or warnings, 2 fatal error.
 
 Read-only. No mutating API calls are made.
 """
@@ -55,15 +72,15 @@ from pathlib import Path
 
 import truststore
 
-# Must run before boto3/urllib3 import (see fmm_nacl_drift.py).
+# Must run before boto3/urllib3 import (see fmm_nacl_audit.py).
 truststore.inject_into_ssl()
 
 import boto3  # noqa: E402
 from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
-from fmm_parity import _g, get_client  # noqa: E402  (also loads .env)
+from lib.aws_common import _g, get_client  # noqa: E402  (also loads .env, sets up logging)
 
-log = logging.getLogger("sg_diff")
+log = logging.getLogger("sg_access_gap")
 
 ARN_RE = re.compile(r"^arn:aws[\w-]*:ec2:([a-z0-9-]+):(\d{12}):security-group/(sg-[0-9a-f]+)$")
 ID_RE = re.compile(r"^sg-[0-9a-f]{8,17}$")
@@ -83,6 +100,7 @@ Box = tuple[Interval, Interval, Interval]   # protocol, port (or ICMP type*256+c
 # Box arithmetic
 # --------------------------------------------------------------------------- #
 def intersects(a: Box, b: Box) -> bool:
+    """True when two boxes overlap in every dimension."""
     return all(x[0] <= y[1] and y[0] <= x[1] for x, y in zip(a, b))
 
 
@@ -130,6 +148,7 @@ def merge(boxes) -> list[Box]:
 
 
 def remainder(box: Box, others: list[Box]) -> list[Box]:
+    """The part of `box` not covered by any of `others`, as disjoint boxes."""
     pieces = [box]
     for o in others:
         pieces = [q for p in pieces for q in subtract(p, o)]
@@ -150,6 +169,11 @@ def proto_num(p) -> int | None:
 
 
 def proto_port_box(proto, from_port, to_port) -> tuple[Interval, Interval]:
+    """Protocol and port intervals for an SG rule.
+
+    TCP/UDP use port ranges. ICMP type/code is encoded as type*256+code so that 'type 8, any
+    code' is a contiguous range. Other protocols, and all-traffic rules, span every port.
+    """
     p = proto_num(proto)
     if p is None:
         return ALL_PROTOS, ALL_PORTS
@@ -167,6 +191,7 @@ def proto_port_box(proto, from_port, to_port) -> tuple[Interval, Interval]:
 
 
 def fmt_proto_ports(pr: Interval, ports: Interval) -> str:
+    """Render a protocol/port box for people, e.g. 'tcp 443', 'icmp type 8', 'all traffic'."""
     if pr == ALL_PROTOS:
         return "all traffic"
     if pr[0] != pr[1]:
@@ -177,6 +202,7 @@ def fmt_proto_ports(pr: Interval, ports: Interval) -> str:
         return f"{name} all" if p in PROTO_NAMES else name
     if p in (1, 58):
         def tc(v):
+            """ICMP 'type/code' text for an encoded value."""
             return f"{v // 256}/{v % 256}"
         lo, hi = ports
         if lo % 256 == 0 and hi == lo + 255:
@@ -190,10 +216,12 @@ def fmt_proto_ports(pr: Interval, ports: Interval) -> str:
 
 
 def addr_interval(net) -> Interval:
+    """A network as an inclusive (first, last) integer address range."""
     return int(net.network_address), int(net.broadcast_address)
 
 
 def fmt_addrs(space: str, iv: Interval) -> list[str]:
+    """Address range back to the fewest CIDRs covering it; group/prefix-list spaces print their id."""
     if space not in ("ipv4", "ipv6"):
         return [space.split(":", 1)[1]]
     cls = ipaddress.IPv4Address if space == "ipv4" else ipaddress.IPv6Address
@@ -202,6 +230,7 @@ def fmt_addrs(space: str, iv: Interval) -> list[str]:
 
 @dataclass
 class SG:
+    """Security group metadata used in reports."""
     group_id: str
     name: str
     vpc_id: str
@@ -209,11 +238,17 @@ class SG:
     region: str
 
     def __str__(self):
+        """e.g. 'sg-0abc (web, vpc-1, us-east-1)'."""
         return f"{self.group_id} ({self.name}, {self.vpc_id}, {self.region})"
 
 
 @dataclass
 class SgRule:
+    """One security group rule, plus the boxes describing the access it grants.
+
+    `peer` is a CIDR, prefix list id, group id, or 'self' for a self-reference, so that
+    self-references in different groups compare equal.
+    """
     group_id: str
     rule_id: str
     egress: bool
@@ -228,6 +263,7 @@ class SgRule:
 
     @classmethod
     def from_api(cls, r: dict) -> "SgRule":
+        """Build from a DescribeSecurityGroupRules entry."""
         gid = r["GroupId"]
         if r.get("CidrIpv4"):
             kind, peer = "ipv4", str(ipaddress.ip_network(r["CidrIpv4"], strict=False))
@@ -246,12 +282,17 @@ class SgRule:
 
     @property
     def direction(self) -> str:
+        """'ingress' or 'egress'."""
         return "egress" if self.egress else "ingress"
 
     def key(self) -> tuple:
+        """Identity used for IDENTICAL matches: direction, protocol/port box and peer (not the description)."""
         return (self.egress, proto_port_box(self.proto, self.from_port, self.to_port), self.peer)
 
     def expand(self, prefix_lists: dict[str, list[str] | None]) -> None:
+        """Fill `boxes`: one per CIDR, one per prefix list entry, or a single opaque box for group
+        references and unreadable prefix lists (matched by id only).
+        """
         pr, ports = proto_port_box(self.proto, self.from_port, self.to_port)
         if self.peer_kind in ("ipv4", "ipv6"):
             cidrs = [self.peer]
@@ -266,12 +307,14 @@ class SgRule:
             self.boxes.append((f"ipv{net.version}", (pr, ports, addr_interval(net))))
 
     def __str__(self) -> str:
+        """e.g. 'tcp 443 from 10.0.0.0/8' or 'tcp 5432 from pl-123 (corp-db, 2 entries)'."""
         pr, ports = proto_port_box(self.proto, self.from_port, self.to_port)
         prep = "to" if self.egress else "from"
         peer = f"{self.peer} ({self.peer_label})" if self.peer_label else self.peer
         return f"{fmt_proto_ports(pr, ports)} {prep} {peer}"
 
     def ref(self) -> str:
+        """Rule as listed under 'overlaps': group, rule id, rule and description."""
         d = f' "{self.description}"' if self.description else ""
         return f"{self.group_id} {self.rule_id} {self}{d}"
 
@@ -281,6 +324,7 @@ class SgRule:
 # --------------------------------------------------------------------------- #
 @dataclass
 class Finding:
+    """Result for one left rule (or a run-level warning), as shown in every report format."""
     severity: str            # error | warn | info
     code: str
     left: str = ""
@@ -298,6 +342,7 @@ CSV_COLUMNS = list(Finding.__dataclass_fields__)
 
 
 def fmt_remainder(rem: dict[str, list[Box]], egress: bool) -> list[str]:
+    """Render uncovered boxes as text lines, one per protocol/port combination, CIDRs merged."""
     prep = "to" if egress else "from"
     by_pp = defaultdict(list)
     for space, boxes in rem.items():
@@ -346,6 +391,11 @@ def compare_rules(rules: list[SgRule], others: list[SgRule], left: SG, rights: l
 
 
 def diff_groups(groups: list[SG], rules: dict[str, list[SgRule]]) -> tuple[list[Finding], list[dict]]:
+    """Check the left group's rules against the combined right groups, per direction.
+
+    Returns the findings and a one-row summary with a verdict per direction
+    ('N gap(s)', 'covered' or 'identical').
+    """
     left, rights = groups[0], groups[1:]
     findings = []
     row = {"left": left.group_id, "right": ", ".join(g.group_id for g in rights)}
@@ -388,6 +438,10 @@ def parse_targets(specs: list[str], default_region: str | None) -> tuple[list[tu
 
 
 def fetch_prefix_lists(ec2, ids: set[str]) -> tuple[dict[str, list[str] | None], dict[str, str], list[str]]:
+    """Read the names and current entries of the referenced prefix lists.
+
+    Returns (entries by id, None when unreadable; names by id; error lines for warnings).
+    """
     entries: dict[str, list[str] | None] = {}
     names: dict[str, str] = {}
     errors = []
@@ -412,6 +466,9 @@ def fetch_prefix_lists(ec2, ids: set[str]) -> tuple[dict[str, list[str] | None],
 
 
 def load(session_factory, targets: list[tuple[str, str]]):
+    """Fetch the groups, their rules and referenced prefix lists, region by region, and expand
+    every rule into boxes. Returns the groups in argument order, rules by group, and warnings.
+    """
     groups: dict[str, SG] = {}
     rules: dict[str, list[SgRule]] = {}
     findings: list[Finding] = []
@@ -453,6 +510,9 @@ def load(session_factory, targets: list[tuple[str, str]]):
 # Output
 # --------------------------------------------------------------------------- #
 def print_report(groups: list[SG], rules, findings: list[Finding], summary: list[dict], show_covered: bool) -> None:
+    """Print the text report: groups, warnings, then per direction each gap with its absent
+    access and the overlapping right rules (covered rules only with `show_covered`).
+    """
     print()
     for i, g in enumerate(groups):
         print(f"{'left ' if i == 0 else 'right'}  {g}  rules: "
@@ -513,19 +573,26 @@ td ul { margin:0; padding-left:16px; } .wrap { overflow-x:auto; }
 """
 
 def verdict_class(v: str) -> str:
+    """Badge colour for a direction verdict."""
     return "error" if "gap" in v else "ok"
 
 
 def render_html(payload: dict, generated: str) -> str:
+    """Build the static HTML report: groups, verdicts, gap tables per direction, and every
+    group's full rule list.
+    """
     e = html.escape
 
     def ul(items):
+        """HTML bullet list, or nothing when empty."""
         return "<ul>" + "".join(f"<li class='mono'>{e(x)}</li>" for x in items) + "</ul>" if items else ""
 
     def badge(text, cls):
+        """HTML badge span."""
         return f"<span class='badge {cls}'>{e(text)}</span>"
 
     def finding_rows(fs):
+        """HTML table rows for a list of findings."""
         return "".join(
             f"<tr><td>{badge(f['severity'], f['severity'])}</td><td class='mono'>{e(f['code'])}</td>"
             f"<td class='mono'>{e(f['rule_id'])}<br>{e(f['rule'])}</td><td>{e(f['description'])}</td>"
@@ -536,8 +603,8 @@ def render_html(payload: dict, generated: str) -> str:
             "<th>Overlapping right rules</th><th>Detail</th></tr>")
     out = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
            f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
-           f"<title>Security group diff</title><style>{HTML_CSS}</style></head><body>",
-           f"<h1>Security group diff</h1><div class='muted'>Account {e(payload['account'])} &middot; "
+           f"<title>Security group access gap</title><style>{HTML_CSS}</style></head><body>",
+           f"<h1>Security group access gap</h1><div class='muted'>Account {e(payload['account'])} &middot; "
            f"generated {e(generated)} &middot; access granted by the left group that the right group(s) combined do not grant "
            f"&middot; descriptions shown for reference, not compared</div>"]
 
@@ -594,6 +661,7 @@ def render_html(payload: dict, generated: str) -> str:
 
 
 def write_outputs(payload: dict, findings: list[Finding], json_path, csv_path, html_path=None) -> None:
+    """Write the JSON, CSV and HTML reports to whichever paths are set."""
     for path in (json_path, csv_path, html_path):
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -618,6 +686,7 @@ def write_outputs(payload: dict, findings: list[Finding], json_path, csv_path, h
 # CLI
 # --------------------------------------------------------------------------- #
 def main() -> int:
+    """Command-line entry point. Returns 0 no gaps, 1 gaps or warnings, 2 fatal."""
     p = argparse.ArgumentParser(
         description="Find access granted by the left security group that the right group(s), combined, do not grant "
                     "(prefix lists expanded, overlapping CIDRs resolved).",
@@ -687,7 +756,7 @@ def main() -> int:
     if not args.no_save:
         now = dt.datetime.now()
         slug = "_".join(g.group_id for g in groups)[:80]
-        stem = Path(args.out_dir) / now.strftime("%Y-%m-%d") / f"{now.strftime('%H%M%S')}_sgdiff_{slug}"
+        stem = Path(args.out_dir) / "sg_access_gap" / now.strftime("%Y-%m-%d") / f"{now.strftime('%H%M%S')}_sggap_{slug}"
         paths = {"json": f"{stem}.json", "csv": f"{stem}.csv", "html": f"{stem}.html"}
     json_path = args.json_out or paths.get("json")
     csv_path = args.csv_out or paths.get("csv")
