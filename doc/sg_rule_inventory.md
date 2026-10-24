@@ -72,11 +72,11 @@ group id, like any other reference.
 | Section | Contents |
 |---|---|
 | Access tester | See [below](#access-tester) |
-| Interfaces | Each interface given: what it is attached to, its VPC, and its groups |
-| Group attachment differences | With two or more interfaces: groups attached to some of them but not all |
-| Interface differences | With two or more interfaces: access allowed on some of them but not others. See [below](#comparing-interfaces) |
-| Groups | Name, VPC, region, the interface it came from, ingress/egress rule counts, description |
-| Rules | Every rule of every group, one row per rule. Filter and sort by group, group name, direction, protocol, ports, peer, peer type and *also granted*; unique counts and a per-group summary |
+| Interfaces and functions | Each interface (given directly or from an EC2 instance) and Lambda function: type, account, what it is attached to, its VPC, and its groups |
+| Group attachment differences | With two or more interfaces / functions: groups attached to some of them but not all |
+| Interface differences | With two or more interfaces / functions: access allowed on some of them but not others. See [below](#comparing-interfaces) |
+| Groups | Name, account, VPC, region, the interface or function it came from, ingress/egress rule counts, description |
+| Rules | Every rule of every group, one row per rule. Filter and sort by group, group name, account, direction, protocol, ports, peer, peer type and *also granted*; unique counts and a per-group summary |
 | Combined access | The union of all rules per direction: one row per protocol/port, with the merged CIDRs (or group / prefix-list references) and the groups and rules that grant them |
 
 **Also granted** says how much of a rule's access other rules in the set
@@ -91,9 +91,10 @@ Prefix lists are expanded to their current entries. Self-references show as
 
 ## Comparing interfaces
 
-Give two or more interfaces, for example the members of an Auto Scaling group
-or the primary and standby of a pair, and the report lists only what differs
-between them.
+Give two or more interfaces, EC2 instances or Lambda functions, for example
+the members of an Auto Scaling group or the primary and standby of a pair,
+and the report lists only what differs between them. Each interface of an
+instance and each function counts as one.
 
 - Each interface's access is the union of all its groups' rules, per direction.
 - The interfaces' access is split into exact pieces (protocol / ports × addresses), each tagged with the interfaces that allow it.
@@ -109,11 +110,12 @@ interfaces appear only under group attachment differences.
 
 The table filters by direction, protocol / ports, allowed on and not allowed
 on. A summary counts the differences per interface that lacks the access.
-The text report ends with the same list, or "none: every interface allows
-exactly the same access".
+By default the text report gives the number of differences and how many
+each interface / function lacks (or "no differences"); with `--show-rules`
+it lists every difference and the rules responsible.
 
-Groups given directly, not through an interface, are not part of this
-comparison.
+Groups given directly, not through an interface, instance or function, are
+not part of this comparison.
 
 ## Access tester
 
@@ -218,7 +220,7 @@ could recompute the hash.
 
 | Flag | Description |
 |---|---|
-| `SG_OR_ENI ...` | Group or interface ids / ARNs |
+| `TARGET ...` | Security group, network interface or EC2 instance ids / ARNs, or Lambda function ARNs; see [Usage](#usage) |
 | `--profile NAME` | AWS profile (default: chosen as [above](#accounts-and-profiles)) |
 | `--region REGION` | Region for bare ids |
 | `--show-rules` | Text report: list every rule per group, the combined access, and each interface difference with its rules. Without it, the text report is a summary: one line per group and counts only. The HTML, CSV and JSON reports always include everything |
