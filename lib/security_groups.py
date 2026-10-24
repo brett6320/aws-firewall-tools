@@ -1,6 +1,7 @@
 """
-Security groups: parse group / interface identifiers, choose the profile, and
-load groups with their rules and prefix lists.
+Security groups: parse group / interface / instance / Lambda identifiers, choose
+the profile, find the groups that apply, and load them with their rules and
+prefix lists.
 
 Intent: tools that compare or report on security groups need the same steps -
 accept ARNs or ids, read every rule with describe_security_group_rules, expand
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 import boto3
 from botocore.exceptions import ClientError
 
-from lib.accounts import pick_profile, profile_lookup
+from lib.accounts import caller_account, pick_profile, profile_lookup
 from lib.aws_common import _g, err_text, get_client
 from lib.boxes import Box, addr_interval, fmt_proto_ports, proto_port_box
 
@@ -32,6 +33,11 @@ ARN_RE = re.compile(r"^arn:aws[\w-]*:ec2:([a-z0-9-]+):(\d{12}):security-group/(s
 ID_RE = re.compile(r"^sg-[0-9a-f]{8,17}$")
 ENI_ARN_RE = re.compile(r"^arn:aws[\w-]*:ec2:([a-z0-9-]+):(\d{12}):network-interface/(eni-[0-9a-f]+)$")
 ENI_ID_RE = re.compile(r"^eni-[0-9a-f]{8,17}$")
+INSTANCE_ARN_RE = re.compile(r"^arn:aws[\w-]*:ec2:([a-z0-9-]+):(\d{12}):instance/(i-[0-9a-f]+)$")
+INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
+LAMBDA_ARN_RE = re.compile(r"^arn:aws[\w-]*:lambda:([a-z0-9-]+):(\d{12}):function:([A-Za-z0-9_-]+(?::[A-Za-z0-9_$-]+)?)$")
+# Workloads stand for the security groups that apply to them.
+WORKLOAD_ARN_RES = (ENI_ARN_RE, INSTANCE_ARN_RE, LAMBDA_ARN_RE)
 
 
 @dataclass
@@ -135,34 +141,55 @@ def split_specs(specs: list[str]) -> list[str]:
 
 
 def spec_accounts(specs: list[str]) -> set[str]:
-    """Account ids named by group or interface ARNs among `specs`."""
+    """Account ids named by group, interface, instance or Lambda function ARNs among `specs`."""
     out = set()
     for spec in split_specs(specs):
-        m = ARN_RE.match(spec) or ENI_ARN_RE.match(spec)
+        m = next((r.match(spec) for r in (ARN_RE, *WORKLOAD_ARN_RES) if r.match(spec)), None)
         if m:
             out.add(m.group(2))
     return out
 
 
+def parse_target(spec: str, default_region: str | None, allow_workloads: bool = False) -> tuple[str | None, str, str]:
+    """One target -> (account named by its ARN or None, region, id). id is a group id, or with
+    allow_workloads also an interface id (eni-), an instance id (i-) or
+    'lambda:<function>[:<version or alias>]' (Lambda only by ARN)."""
+    arn_res = (ARN_RE, *WORKLOAD_ARN_RES) if allow_workloads else (ARN_RE,)
+    m = next((r.match(spec) for r in arn_res if r.match(spec)), None)
+    if m:
+        region, account, rid = m.groups()
+        return account, region, f"lambda:{rid}" if m.re is LAMBDA_ARN_RE else rid
+    if ID_RE.match(spec) or (allow_workloads and (ENI_ID_RE.match(spec) or INSTANCE_ID_RE.match(spec))):
+        if not default_region:
+            raise ValueError(f"{spec}: bare id needs --region (or AWS_REGION / profile region)")
+        return None, default_region, spec
+    kinds = "security group, network interface, EC2 instance or Lambda function" if allow_workloads else "security group"
+    raise ValueError(f"not a {kinds} ARN or id: {spec!r}")
+
+
+def parse_account_targets(specs: list[str], default_region: str | None) -> list[tuple[str | None, str, str]]:
+    """Targets of any kind, possibly in several accounts -> [(account or None for bare ids, region,
+    id)] in argument order, duplicates dropped."""
+    seen, out = set(), []
+    for t in (parse_target(spec, default_region, allow_workloads=True) for spec in split_specs(specs)):
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    if not out:
+        raise ValueError("no targets given")
+    return out
+
+
 def parse_targets(specs: list[str], default_region: str | None, min_groups: int = 2,
-                  allow_enis: bool = False) -> tuple[list[tuple[str, str]], str | None]:
-    """-> [(region, group_or_eni_id)] in argument order (duplicates dropped), and the account
-    named by ARNs (None if only ids). ENI ids / ARNs are accepted only with allow_enis.
-    """
+                  allow_workloads: bool = False) -> tuple[list[tuple[str, str]], str | None]:
+    """-> [(region, id)] in argument order (duplicates dropped) and the one account named by
+    ARNs (None if only ids); ARNs from several accounts are refused. See parse_target."""
     targets, accounts = [], set()
     for spec in split_specs(specs):
-        m = ARN_RE.match(spec) or (ENI_ARN_RE.match(spec) if allow_enis else None)
-        if m:
-            region, account, rid = m.groups()
+        account, region, rid = parse_target(spec, default_region, allow_workloads)
+        if account:
             accounts.add(account)
-            targets.append((region, rid))
-        elif ID_RE.match(spec) or (allow_enis and ENI_ID_RE.match(spec)):
-            if not default_region:
-                raise ValueError(f"{spec}: bare id needs --region (or AWS_REGION / profile region)")
-            targets.append((default_region, spec))
-        else:
-            kinds = "security group or network interface" if allow_enis else "security group"
-            raise ValueError(f"not a {kinds} ARN or id: {spec!r}")
+        targets.append((region, rid))
     if len(accounts) > 1:
         raise ValueError(f"security groups must be in one account; ARNs name {', '.join(sorted(accounts))}")
     seen = set()
@@ -173,34 +200,54 @@ def parse_targets(specs: list[str], default_region: str | None, min_groups: int 
     return targets, (accounts.pop() if accounts else None)
 
 
-def resolve_profile(args, account: str | None) -> tuple[str | None, str]:
-    """Profile to read the groups with, and how it was chosen.
+def resolve_account_profiles(args, arn_accounts: set[str], bare_ids: bool) \
+        -> tuple[dict[str, tuple[str | None, str]], str | None]:
+    """The profile to read each account with, and the account bare ids belong to.
 
-    --profile wins. Otherwise, when ARNs name an account, that account's local profile
-    (profiles ending in an excluded suffix such as -priv / -cpar are never used;
-    --account-profile forces one). Otherwise AWS_PROFILE, else the default credential chain.
-    The caller verifies the profile's account.
+    * --profile is used for its own account.
+    * Each other account named by ARNs uses its local profile, found by account id (profiles
+      ending in an excluded suffix such as -priv / -cpar are never used; --account-profile
+      forces one).
+    * Bare ids belong to the --profile account; without --profile, to the single ARN account
+      if there is exactly one; with no ARNs at all, to AWS_PROFILE or the default credentials.
+      Bare ids next to ARNs from several accounts (and no --profile) are ambiguous: refused.
+
+    Every profile is verified with sts:GetCallerIdentity. Returns ({account: (profile,
+    how it was chosen)}, bare-id account or None).
     """
+    out: dict[str, tuple[str | None, str]] = {}
     if args.profile:
-        return args.profile, "--profile"
-    if account:
-        profile, note = pick_profile(account, *profile_lookup(args))
+        out[caller_account(args.profile)] = (args.profile, "--profile")
+    pmap, overrides = profile_lookup(args)
+    for account in sorted(arn_accounts - set(out)):
+        profile, note = pick_profile(account, pmap, overrides)
         if not profile:
             raise ValueError(f"no local AWS profile for account {account} (excluding "
-                             f"{args.exclude_profile_suffix}); use --profile or --account-profile")
+                             f"{args.exclude_profile_suffix}); use --account-profile")
         if note and note != "override":
             log.warning("Account %s: %s", account, note)
-        return profile, f"local profile for account {account}" + (" (override)" if note == "override" else "")
-    env = os.getenv("AWS_PROFILE") or None
-    return env, "AWS_PROFILE" if env else "default credentials"
-
-
-def check_account(profile: str | None, region: str, account: str | None) -> str:
-    """Account id of the profile; ValueError when ARNs name a different account."""
-    actual = get_client("sts", boto3.Session(profile_name=profile, region_name=region)).get_caller_identity()["Account"]
-    if account and actual != account:
-        raise ValueError(f"profile {profile or '(default)'} is account {actual}; ARNs name {account}")
-    return actual
+        actual = caller_account(profile)
+        if actual != account:
+            raise ValueError(f"profile {profile} is account {actual}, expected {account}")
+        out[account] = (profile, f"local profile for account {account}" + (" (override)" if note == "override" else ""))
+    bare = None
+    if args.profile and not bare_ids:
+        mine = next(a for a, (p, _) in out.items() if p == args.profile)
+        if mine not in arn_accounts:
+            log.warning("--profile %s is account %s, which no target is in; not used", args.profile, mine)
+    if bare_ids:
+        if args.profile:
+            bare = next(a for a, (p, _) in out.items() if p == args.profile)
+        elif len(arn_accounts) == 1:
+            bare = next(iter(arn_accounts))
+        elif not arn_accounts:
+            env = os.getenv("AWS_PROFILE") or None
+            bare = caller_account(env)
+            out[bare] = (env, "AWS_PROFILE" if env else "default credentials")
+        else:
+            raise ValueError(f"bare ids are ambiguous next to ARNs from several accounts "
+                             f"({', '.join(sorted(arn_accounts))}); use ARNs, or --profile for the bare ids' account")
+    return out, bare
 
 
 def fetch_prefix_lists(ec2, ids: set[str]) -> tuple[dict[str, list[str] | None], dict[str, str], list[str]]:
@@ -231,37 +278,86 @@ def fetch_prefix_lists(ec2, ids: set[str]) -> tuple[dict[str, list[str] | None],
     return entries, names, errors
 
 
-def resolve_enis(session_factory, targets: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], list[dict]]:
-    """Replace ENI targets by their attached groups (in place, argument order kept).
+def resolve_workloads(session_factory, targets: list[tuple[str, str]]) \
+        -> tuple[list[tuple[str, str]], list[dict], list[str]]:
+    """Replace workload targets by the security groups that apply to them (argument order kept).
 
-    Returns the group targets and one dict per interface: eni_id, region, description,
-    attachment (instance id or interface type), groups.
+    * network interface (eni-): its groups
+    * EC2 instance (i-): each of its network interfaces, with that interface's groups
+    * Lambda function (lambda:name[:qualifier]): the groups in its VPC configuration; a
+      function not attached to a VPC has none, and is reported in the warnings and skipped
+
+    Returns the group targets, one dict per interface / function (id, kind: eni | instance |
+    lambda, region, attachment, vpc_id, description, groups), and warning lines.
     """
-    enis = defaultdict(list)
+    by_region: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for region, rid in targets:
-        if rid.startswith("eni-"):
-            enis[region].append(rid)
-    found: dict[str, dict] = {}
-    for region, ids in enis.items():
-        ec2 = get_client("ec2", session_factory(region))
+        kind = "eni" if rid.startswith("eni-") else "instance" if rid.startswith("i-") else \
+            "lambda" if rid.startswith("lambda:") else None
+        if kind:
+            by_region[region][kind].append(rid)
+    found: dict[tuple[str, str], list[dict]] = {}
+    warnings: list[str] = []
+    for region, kinds in by_region.items():
+        session = session_factory(region)
+        if kinds["eni"] or kinds["instance"]:
+            ec2 = get_client("ec2", session)
         try:
-            resp = ec2.describe_network_interfaces(NetworkInterfaceIds=ids)
+            if kinds["eni"]:
+                for n in _g(ec2.describe_network_interfaces(NetworkInterfaceIds=kinds["eni"]), "NetworkInterfaces", []):
+                    att = _g(n, "Attachment", {})
+                    found[(region, n["NetworkInterfaceId"])] = [{
+                        "id": n["NetworkInterfaceId"], "kind": "eni", "region": region,
+                        "attachment": att.get("InstanceId") or n.get("InterfaceType") or "",
+                        "vpc_id": n.get("VpcId", ""), "description": n.get("Description", ""),
+                        "groups": [g["GroupId"] for g in _g(n, "Groups", [])]}]
+            if kinds["instance"]:
+                for page in ec2.get_paginator("describe_instances").paginate(InstanceIds=kinds["instance"]):
+                    for res in _g(page, "Reservations", []):
+                        for inst in _g(res, "Instances", []):
+                            name = next((t["Value"] for t in _g(inst, "Tags", []) if t.get("Key") == "Name"), "")
+                            nics = sorted(_g(inst, "NetworkInterfaces", []),
+                                          key=lambda n: _g(n, "Attachment", {}).get("DeviceIndex", 0))
+                            found[(region, inst["InstanceId"])] = [{
+                                "id": n["NetworkInterfaceId"], "kind": "instance", "region": region,
+                                "attachment": f"{inst['InstanceId']} eth{_g(n, 'Attachment', {}).get('DeviceIndex', 0)}",
+                                "vpc_id": n.get("VpcId", ""), "description": name or n.get("Description", ""),
+                                "groups": [g["GroupId"] for g in _g(n, "Groups", [])]} for n in nics]
+            if kinds["lambda"]:
+                lam = get_client("lambda", session)
+                for rid in kinds["lambda"]:
+                    fn, _, qual = rid[len("lambda:"):].partition(":")
+                    cfg = lam.get_function_configuration(FunctionName=fn, **({"Qualifier": qual} if qual else {}))
+                    vpc = _g(cfg, "VpcConfig", {})
+                    sgs = list(vpc.get("SecurityGroupIds") or [])
+                    if not sgs:
+                        warnings.append(f"Lambda {fn}{':' + qual if qual else ''}: not attached to a VPC, so no "
+                                        "security groups apply; skipped")
+                        found[(region, rid)] = []
+                        continue
+                    found[(region, rid)] = [{
+                        "id": fn + (f":{qual}" if qual else ""), "kind": "lambda", "region": region,
+                        "attachment": cfg.get("FunctionArn", ""), "vpc_id": vpc.get("VpcId", ""),
+                        "description": f"Lambda {cfg.get('Runtime') or cfg.get('PackageType', '')}, "
+                                       f"subnets {', '.join(vpc.get('SubnetIds') or [])}",
+                        "groups": sgs}]
         except ClientError as e:
             raise ValueError(f"{region}: {err_text(e)}") from e
-        for n in _g(resp, "NetworkInterfaces", []):
-            att = _g(n, "Attachment", {})
-            found[n["NetworkInterfaceId"]] = {
-                "eni_id": n["NetworkInterfaceId"], "region": region, "description": n.get("Description", ""),
-                "attachment": att.get("InstanceId") or n.get("InterfaceType") or "",
-                "vpc_id": n.get("VpcId", ""), "groups": [g["GroupId"] for g in _g(n, "Groups", [])]}
-    out, seen = [], set()
+    out, seen, entries = [], set(), []
     for region, rid in targets:
-        ids = found[rid]["groups"] if rid.startswith("eni-") else [rid]
-        for gid in ids:
+        if (region, rid) in found:
+            items = found[(region, rid)]
+            entries += [x for x in items if x["id"] not in {e["id"] for e in entries}]
+            gids = [g for x in items for g in x["groups"]]
+        elif rid.startswith(("eni-", "i-", "lambda:")):
+            raise ValueError(f"{region}: {rid} not found")
+        else:
+            gids = [rid]
+        for gid in gids:
             if (region, gid) not in seen:
                 seen.add((region, gid))
                 out.append((region, gid))
-    return out, [found[rid] for _, rid in targets if rid.startswith("eni-")]
+    return out, entries, warnings
 
 
 def load_groups(session_factory, targets: list[tuple[str, str]]):
