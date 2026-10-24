@@ -60,11 +60,9 @@ import argparse
 import csv
 import datetime as dt
 import html
-import ipaddress
 import json
 import logging
 import os
-import re
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -78,114 +76,14 @@ truststore.inject_into_ssl()
 import boto3  # noqa: E402
 from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
-from lib.aws_common import _g, get_client  # noqa: E402  (also loads .env, sets up logging)
-from lib.boxes import (ALL_PORTS, ALL_PROTOS, Box, addr_interval, fmt_addrs, fmt_proto_ports,  # noqa: E402,F401
-                       intersects, merge, proto_port_box, remainder)
+from lib.aws_common import get_client  # noqa: E402  (also loads .env, sets up logging)
+from lib.boxes import Box, fmt_addrs, fmt_proto_ports, intersects, merge, remainder  # noqa: E402
+from lib.security_groups import SG, SgRule, load_groups, parse_targets  # noqa: E402
 
 log = logging.getLogger("sg_access_gap")
 
-ARN_RE = re.compile(r"^arn:aws[\w-]*:ec2:([a-z0-9-]+):(\d{12}):security-group/(sg-[0-9a-f]+)$")
-ID_RE = re.compile(r"^sg-[0-9a-f]{8,17}$")
-
 SEVERITY_ORDER = {"error": 0, "warn": 1, "info": 2}
 MAX_CIDRS_SHOWN = 8
-
-
-# --------------------------------------------------------------------------- #
-# Box arithmetic
-# --------------------------------------------------------------------------- #
-# --------------------------------------------------------------------------- #
-# Rules
-# --------------------------------------------------------------------------- #
-@dataclass
-class SG:
-    """Security group metadata used in reports."""
-    group_id: str
-    name: str
-    vpc_id: str
-    owner: str
-    region: str
-
-    def __str__(self):
-        """e.g. 'sg-0abc (web, vpc-1, us-east-1)'."""
-        return f"{self.group_id} ({self.name}, {self.vpc_id}, {self.region})"
-
-
-@dataclass
-class SgRule:
-    """One security group rule, plus the boxes describing the access it grants.
-
-    `peer` is a CIDR, prefix list id, group id, or 'self' for a self-reference, so that
-    self-references in different groups compare equal.
-    """
-    group_id: str
-    rule_id: str
-    egress: bool
-    proto: str
-    from_port: int | None
-    to_port: int | None
-    peer: str            # CIDR, pl-..., sg-..., or "self"
-    peer_kind: str       # ipv4 | ipv6 | pl | sg
-    description: str = ""
-    peer_label: str = ""
-    boxes: list[tuple[str, Box]] = field(default_factory=list)
-
-    @classmethod
-    def from_api(cls, r: dict) -> "SgRule":
-        """Build from a DescribeSecurityGroupRules entry."""
-        gid = r["GroupId"]
-        if r.get("CidrIpv4"):
-            kind, peer = "ipv4", str(ipaddress.ip_network(r["CidrIpv4"], strict=False))
-        elif r.get("CidrIpv6"):
-            kind, peer = "ipv6", str(ipaddress.ip_network(r["CidrIpv6"], strict=False))
-        elif r.get("PrefixListId"):
-            kind, peer = "pl", r["PrefixListId"]
-        else:
-            ref = _g(r, "ReferencedGroupInfo", {})
-            kind, peer = "sg", ref.get("GroupId", "?")
-            if peer == gid:
-                peer = "self"
-        return cls(group_id=gid, rule_id=r.get("SecurityGroupRuleId", ""), egress=bool(r.get("IsEgress")),
-                   proto=str(r.get("IpProtocol", "-1")), from_port=r.get("FromPort"), to_port=r.get("ToPort"),
-                   peer=peer, peer_kind=kind, description=r.get("Description") or "")
-
-    @property
-    def direction(self) -> str:
-        """'ingress' or 'egress'."""
-        return "egress" if self.egress else "ingress"
-
-    def key(self) -> tuple:
-        """Identity used for IDENTICAL matches: direction, protocol/port box and peer (not the description)."""
-        return (self.egress, proto_port_box(self.proto, self.from_port, self.to_port), self.peer)
-
-    def expand(self, prefix_lists: dict[str, list[str] | None]) -> None:
-        """Fill `boxes`: one per CIDR, one per prefix list entry, or a single opaque box for group
-        references and unreadable prefix lists (matched by id only).
-        """
-        pr, ports = proto_port_box(self.proto, self.from_port, self.to_port)
-        if self.peer_kind in ("ipv4", "ipv6"):
-            cidrs = [self.peer]
-        elif self.peer_kind == "pl" and prefix_lists.get(self.peer) is not None:
-            cidrs = prefix_lists[self.peer]
-        else:
-            self.boxes = [(f"{self.peer_kind}:{self.peer}", (pr, ports, (0, 0)))]
-            return
-        self.boxes = []
-        for c in cidrs:
-            net = ipaddress.ip_network(c, strict=False)
-            self.boxes.append((f"ipv{net.version}", (pr, ports, addr_interval(net))))
-
-    def __str__(self) -> str:
-        """e.g. 'tcp 443 from 10.0.0.0/8' or 'tcp 5432 from pl-123 (corp-db, 2 entries)'."""
-        pr, ports = proto_port_box(self.proto, self.from_port, self.to_port)
-        prep = "to" if self.egress else "from"
-        peer = f"{self.peer} ({self.peer_label})" if self.peer_label else self.peer
-        return f"{fmt_proto_ports(pr, ports)} {prep} {peer}"
-
-    def ref(self) -> str:
-        """Rule as listed under 'overlaps': group, rule id, rule and description."""
-        d = f' "{self.description}"' if self.description else ""
-        return f"{self.group_id} {self.rule_id} {self}{d}"
 
 
 # --------------------------------------------------------------------------- #
@@ -282,97 +180,12 @@ def diff_groups(groups: list[SG], rules: dict[str, list[SgRule]]) -> tuple[list[
 # --------------------------------------------------------------------------- #
 # AWS
 # --------------------------------------------------------------------------- #
-def parse_targets(specs: list[str], default_region: str | None) -> tuple[list[tuple[str, str]], str | None]:
-    """-> [(region, group_id)], account from ARNs (None if only IDs)."""
-    targets, accounts = [], set()
-    for spec in (s.strip() for x in specs for s in x.split(",") if s.strip()):
-        m = ARN_RE.match(spec)
-        if m:
-            region, account, gid = m.groups()
-            accounts.add(account)
-            targets.append((region, gid))
-        elif ID_RE.match(spec):
-            if not default_region:
-                raise ValueError(f"{spec}: bare group id needs --region (or AWS_REGION / profile region)")
-            targets.append((default_region, spec))
-        else:
-            raise ValueError(f"not a security group ARN or id: {spec!r}")
-    if len(accounts) > 1:
-        raise ValueError(f"security groups must be in one account; ARNs name {', '.join(sorted(accounts))}")
-    seen = set()
-    targets = [t for t in targets if not (t in seen or seen.add(t))]
-    if len(targets) < 2:
-        raise ValueError("need at least two distinct security groups")
-    return targets, (accounts.pop() if accounts else None)
-
-
-def fetch_prefix_lists(ec2, ids: set[str]) -> tuple[dict[str, list[str] | None], dict[str, str], list[str]]:
-    """Read the names and current entries of the referenced prefix lists.
-
-    Returns (entries by id, None when unreadable; names by id; error lines for warnings).
-    """
-    entries: dict[str, list[str] | None] = {}
-    names: dict[str, str] = {}
-    errors = []
-    if not ids:
-        return entries, names, errors
-    try:
-        for page in ec2.get_paginator("describe_managed_prefix_lists").paginate(PrefixListIds=sorted(ids)):
-            for pl in _g(page, "PrefixLists", []):
-                names[pl["PrefixListId"]] = pl.get("PrefixListName", "")
-    except ClientError as e:
-        log.debug("describe_managed_prefix_lists: %s", e)
-    for pid in sorted(ids):
-        try:
-            cidrs = []
-            for page in ec2.get_paginator("get_managed_prefix_list_entries").paginate(PrefixListId=pid):
-                cidrs.extend(e["Cidr"] for e in _g(page, "Entries", []))
-            entries[pid] = cidrs
-        except ClientError as e:
-            entries[pid] = None
-            errors.append(f"{pid}: {e.response.get('Error', {}).get('Code', e)}")
-    return entries, names, errors
-
-
 def load(session_factory, targets: list[tuple[str, str]]):
-    """Fetch the groups, their rules and referenced prefix lists, region by region, and expand
-    every rule into boxes. Returns the groups in argument order, rules by group, and warnings.
-    """
-    groups: dict[str, SG] = {}
-    rules: dict[str, list[SgRule]] = {}
-    findings: list[Finding] = []
-    by_region = defaultdict(list)
-    for region, gid in targets:
-        by_region[region].append(gid)
-    for region, ids in by_region.items():
-        ec2 = get_client("ec2", session_factory(region))
-        try:
-            resp = ec2.describe_security_groups(GroupIds=ids)
-        except ClientError as e:
-            raise ValueError(f"{region}: {e.response.get('Error', {}).get('Message', e)}") from e
-        for g in resp["SecurityGroups"]:
-            groups[g["GroupId"]] = SG(g["GroupId"], g.get("GroupName", ""), g.get("VpcId", ""),
-                                      g.get("OwnerId", ""), region)
-            rules[g["GroupId"]] = []
-        for page in ec2.get_paginator("describe_security_group_rules").paginate(
-                Filters=[{"Name": "group-id", "Values": ids}]):
-            for r in _g(page, "SecurityGroupRules", []):
-                rules[r["GroupId"]].append(SgRule.from_api(r))
-        pl_ids = {r.peer for gid in ids for r in rules[gid] if r.peer_kind == "pl"}
-        entries, names, errors = fetch_prefix_lists(ec2, pl_ids)
-        for err in errors:
-            findings.append(Finding("warn", "PREFIX_LIST_UNRESOLVED", detail=f"{region} {err}; compared by id only"))
-        for gid in ids:
-            for r in rules[gid]:
-                if r.peer_kind == "pl":
-                    n = entries.get(r.peer)
-                    r.peer_label = ", ".join(x for x in (names.get(r.peer, ""),
-                                                         f"{len(n)} entries" if n is not None else "unresolved") if x)
-                r.expand(entries)
-    ordered = [groups[gid] for _, gid in targets]
-    for g in ordered:
-        rules[g.group_id].sort(key=lambda r: (r.egress, r.key()[1], r.peer))
-    return ordered, rules, findings
+    """Groups in argument order, rules by group, and PREFIX_LIST_UNRESOLVED warnings
+    (see lib.security_groups.load_groups)."""
+    groups, rules, warnings = load_groups(session_factory, targets)
+    return groups, rules, [Finding("warn", "PREFIX_LIST_UNRESOLVED", detail=f"{w}; compared by id only")
+                           for w in warnings]
 
 
 # --------------------------------------------------------------------------- #

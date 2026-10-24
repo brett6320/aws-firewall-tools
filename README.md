@@ -22,6 +22,7 @@ have in common.
 | Tool | Question it answers |
 |---|---|
 | [`nacl_shadow.py`](doc/nacl_shadow.md) | Which NACL rules can never take effect, or are partly overridden, because an earlier rule already matches their traffic? |
+| [`sg_rule_inventory.py`](doc/sg_rule_inventory.md) | What do these security groups (or the groups on an interface) allow, together? Would a given flow be allowed, and what if a rule or group were removed? (interactive tester in the HTML report) |
 | [`sg_access_gap.py`](doc/sg_access_gap.md) | What access does one security group grant that one or more others, combined, do not? |
 | [`sg_quota_audit.py`](doc/sg_quota_audit.md) | Which security groups and network interfaces are at or near their quotas, and which groups are stale, unattached, or default groups with rules? |
 | [`prefix_list_audit.py`](doc/prefix_list_audit.md) | Are managed prefix lists full, unused, oversized for the security group rule quota, or different between same-named copies? |
@@ -62,7 +63,7 @@ flags override them.
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `AWS_PROFILE` | all | Default AWS profile (`--profile` overrides) |
+| `AWS_PROFILE` | all | Default AWS profile (`--profile` overrides; `sg_rule_inventory` prefers the profile for the account in its ARNs) |
 | `AWS_REGION` | all | Default region (`--region` overrides) |
 | `FMM_REPORT_DIR` | all | Base directory for saved reports (default `./reports`) |
 | `FMM_ADMIN_ACCOUNT` | `fmm_*` | FMS administrator (security) account id; its profile is found by account id |
@@ -86,6 +87,7 @@ Tools that look inside member accounts scan the accounts you select:
   - `--profile`'s account by default;
   - `--account ID[,ID]` for specific accounts;
   - `--all-accounts` for every account with a local profile.
+- `sg_rule_inventory` reads one account. Without `--profile`, it uses the local profile for the account named in its ARNs.
 
 Each account's profile comes from the local AWS config (`AWS_CONFIG_FILE` is honoured):
 - A profile's account is its `sso_account_id`, `aws_account_id`, or the account in its `role_arn`.
@@ -124,7 +126,8 @@ assets, light/dark aware), safe to attach or email. Most are interactive:
 - info-level rows hidden until ticked
 - the current view kept in the URL fragment, so it can be bookmarked
 
-The `sg_access_gap` report is a static page laid out per direction.
+The `sg_access_gap` report is a static page laid out per direction. The
+`sg_rule_inventory` report adds an access tester that runs in the browser.
 
 ## Exit codes
 
@@ -147,12 +150,14 @@ nacl_shadow.py          NACL rules hidden by earlier rules
 prefix_list_audit.py    managed prefix list capacity, usage and drift
 sg_access_gap.py        left SG access absent from right SG(s)
 sg_quota_audit.py       security group / interface quotas and clean-up candidates
+sg_rule_inventory.py    all rules of a set of groups / interfaces, combined access, access tester
 doc/                    one page per tool
 lib/accounts.py         account -> profile mapping, account selection, admin profile
 lib/aws_common.py       AWS sessions/clients, FMS policy calls, regions; loads .env, logging
 lib/boxes.py            protocol x port x address range arithmetic (SG / NACL comparisons)
 lib/html_report.py      self-contained interactive HTML report renderer
 lib/output.py           common output flags, report paths and writers
+lib/security_groups.py  group / interface ids and ARNs, profile choice, loading rules and prefix lists
 .env.example            configuration template
 requirements.txt        Python dependencies
 ```
