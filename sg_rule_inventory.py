@@ -24,6 +24,11 @@ What it does:
          the rule could be removed without changing the collection's access
        * the combined access of the collection per direction: merged CIDRs per
          protocol/port, and which groups grant each piece
+       * with two or more interfaces, only what differs between them: groups
+         attached to some but not all, and the exact access (protocol / ports x
+         addresses) allowed on some but not others, with the rules responsible.
+         Each interface's access is compared exactly, so the same access
+         written differently is not a difference
   4. The HTML report embeds the rule data and an access tester (JavaScript,
      runs in the browser, no AWS access): enter DIRECTION ADDRESS PROTOCOL
      [PORT] tests and see ALLOWED / PARTIAL / DENIED, the rules that grant
@@ -78,7 +83,8 @@ Usage:
     ./sg_rule_inventory.py --region us-east-1 sg-0123456789abcdef0 sg-0fedcba9876543210
     ./sg_rule_inventory.py arn:aws:ec2:us-east-1:111122223333:network-interface/eni-0123456789abcdef0
 
-Exit codes: 0 ok, 1 a referenced prefix list could not be read, 2 fatal error.
+Exit codes: 0 ok, 1 the interfaces differ or a referenced prefix list could not be
+read, 2 fatal error.
 
 Read-only. Only Describe / Get calls are made.
 """
@@ -218,6 +224,66 @@ def combined_access(groups: list[SG], rules: dict[str, list[SgRule]]) -> list[di
 
 
 # --------------------------------------------------------------------------- #
+# Interface differences
+# --------------------------------------------------------------------------- #
+def partition(access: dict[str, dict[str, list[Box]]]) -> list[tuple[str, Box, frozenset]]:
+    """Split the union of several access sets into disjoint pieces, each tagged with the set of
+    owners (interfaces) that allow it. access = {owner: {space: disjoint boxes}}."""
+    regions: list[tuple[str, Box, frozenset]] = []
+    for owner, spaces in access.items():
+        new = []
+        for sp, b, who in regions:
+            hits = [x for x in spaces.get(sp, []) if intersects(b, x)]
+            outside = remainder(b, hits)
+            new += [(sp, p, who | {owner}) for p in remainder(b, outside)] + [(sp, p, who) for p in outside]
+        for sp, boxes in spaces.items():
+            seen = [b for s2, b, _ in regions if s2 == sp]
+            new += [(sp, p, frozenset([owner])) for x in boxes for p in remainder(x, seen)]
+        regions = new
+    return regions
+
+
+def interface_deltas(interfaces: list[dict], rules: dict[str, list[SgRule]]) -> dict:
+    """What differs between the interfaces given (two or more): groups attached to some but not
+    all, and access (protocol / ports x addresses) allowed on some but not all, with the rules
+    responsible. Each interface's access is the union of its groups' rules, compared exactly,
+    so the same access written differently is not a difference."""
+    enis = [n["eni_id"] for n in interfaces]
+    out = {"interfaces": enis, "groups": [], "access": []}
+    if len(enis) < 2:
+        return out
+    every = set(enis)
+    on = {n["eni_id"]: set(n["groups"]) for n in interfaces}
+    for gid in sorted(set().union(*on.values())):
+        has = [e for e in enis if gid in on[e]]
+        if len(has) < len(enis):
+            out["groups"].append({"group_id": gid, "attached_to": has, "missing_on": [e for e in enis if e not in has]})
+    for egress, direction in ((False, "ingress"), (True, "egress")):
+        access = {e: union([b for g in on[e] for r in rules.get(g, []) if r.egress == egress for b in r.boxes])
+                  for e in enis}
+        by_owner: dict[frozenset, dict[str, list[Box]]] = defaultdict(lambda: defaultdict(list))
+        for sp, b, who in partition(access):
+            if who != every:
+                by_owner[who][sp].append(b)
+        prep = "to" if egress else "from"
+        for who, spaces in by_owner.items():
+            by_pp: dict[tuple, list[tuple[str, Box]]] = defaultdict(list)
+            for sp, boxes in spaces.items():
+                for b in merge(boxes):
+                    by_pp[(b[0], b[1])].append((sp, b))
+            for (pr, ports), items in sorted(by_pp.items()):
+                resp = [r for g in sorted({g for e in who for g in on[e]}) for r in rules.get(g, [])
+                        if r.egress == egress and any(sp == s2 and intersects(b, b2) for sp, b in r.boxes for s2, b2 in items)]
+                addrs = [a for sp, b in sorted(items, key=lambda x: (x[0], x[1][2])) for a in fmt_addrs(sp, b[2])]
+                out["access"].append({
+                    "direction": direction, "access": fmt_proto_ports(pr, ports), "addresses": addrs,
+                    "allowed_on": [e for e in enis if e in who], "missing_on": [e for e in enis if e not in who],
+                    "rules": [f"{r.group_id} {r.rule_id} {r}" for r in resp], "prep": prep})
+    out["access"].sort(key=lambda d: (d["direction"] != "ingress", d["access"], d["allowed_on"]))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # HTML access tester data
 # --------------------------------------------------------------------------- #
 def known_prefix_lists(rules: dict[str, list[SgRule]]) -> dict[str, list[str]]:
@@ -247,7 +313,7 @@ def cut(addrs: list[str]) -> str:
 
 
 def print_report(payload: dict, rows: list[RuleRow], combined: list[dict]) -> None:
-    """Text report: interfaces, rules per group, combined access."""
+    """Text report: interfaces, rules per group, combined access, interface differences."""
     print(f"\nAccount {payload['account']} via {via_text(payload)}")
     print(f"Rule data SHA-256 {payload['rule_data_sha256']} (shown in the HTML report and in exported scenarios)")
     for w in payload["warnings"]:
@@ -277,6 +343,19 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict]) -> No
         prep = "to" if direction == "egress" else "from"
         for c in sel:
             print(f"    {c['access']} {prep} {cut(c['addresses'])}   [{', '.join(c['granted_by'])}]")
+    d = payload["interface_deltas"]
+    if len(d["interfaces"]) < 2:
+        return
+    print(f"\n=== differences between {len(d['interfaces'])} interfaces")
+    if not d["groups"] and not d["access"]:
+        print("  none: every interface allows exactly the same access")
+    for g in d["groups"]:
+        print(f"  group {g['group_id']} attached to {', '.join(g['attached_to'])}; not to {', '.join(g['missing_on'])}")
+    for a in d["access"]:
+        print(f"  [{a['direction']}] {a['access']} {a['prep']} {cut(a['addresses'])}")
+        print(f"      allowed on {', '.join(a['allowed_on'])}; not on {', '.join(a['missing_on'])}")
+        for r in a["rules"]:
+            print(f"      rule: {r}")
 
 
 TESTER_HTML = """
@@ -318,7 +397,8 @@ placeholder="change ticket, purpose, assumptions"></label>
 <div class="muted">Differences between two results other than their addresses: verdict, the protocols / ports
 allowed (compared on the protocol / ports both tests cover), and the rules involved.</div>
 <div class="controls"><label>Test A<select data-t="ca" style="max-width:420px"></select></label>
-<label>Test B<select data-t="cb" style="max-width:420px"></select></label><button data-t="swap">Swap</button></div>
+<label>Test B<select data-t="cb" style="max-width:420px"></select></label><button data-t="swap">Swap</button>
+<button data-t="cmphtml">Download comparison report</button><button data-t="cmpcsv">Download comparison CSV</button></div>
 <div class="wrap"><table data-t="cmp"></table></div>
 </section>
 """
@@ -572,8 +652,9 @@ function compare(A, B) {
     if (minus([a.tested], [C]).length || minus([b.tested], [C]).length)
       add("Not compared (tested by one only)", ppOf(minus([a.tested], [C])) || "nothing", ppOf(minus([b.tested], [C])) || "nothing", false);
     add("Allowed for both", ppOf(both) || "nothing", "", false);
-    add("Allowed only for A", ppOf(onlyA) || "nothing", "", onlyA.length > 0);
-    add("Allowed only for B", ppOf(onlyB) || "nothing", "", onlyB.length > 0);
+    // A's extra access under A, B's under B
+    add("Allowed only for this test", ppOf(onlyA) || "nothing", ppOf(onlyB) || "nothing",
+        onlyA.length > 0 || onlyB.length > 0, true);
     const pa = isectAll(a.partial, [C]), pb = isectAll(b.partial, [C]);
     if (pa.length || pb.length)
       add("Allowed for part of the tested addresses", ppOf(pa) || "nothing", ppOf(pb) || "nothing", ppOf(pa) !== ppOf(pb));
@@ -653,12 +734,23 @@ function save() {
   history.replaceState(null, "", "#" + p.toString());
 }
 // Results of a scenario evaluated on its own on/off state (independent of the checkboxes).
-function evaluate(sc) {
+function rawResults(sc) {
   const g = new Set(sc.groups_off || []), r = new Set(sc.rules_off || []);
   const on = new Set(rules.filter(x => !g.has(x.g) && !r.has(x.id)).map(x => x.key));
-  return (sc.tests || "").split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"))
-    .flatMap(l => runLine(l, on)).map(({test, direction, verdict, ok, rem, by, detail}) =>
-      ({test, direction, verdict, allowed: ok, not_allowed: rem, granted_by: by, detail}));
+  return (sc.tests || "").split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#")).flatMap(l => runLine(l, on));
+}
+function evaluate(sc) {
+  return rawResults(sc).map(({test, direction, verdict, ok, rem, by, detail}) =>
+    ({test, direction, verdict, allowed: ok, not_allowed: rem, granted_by: by, detail}));
+}
+// The comparison of a scenario's selected pair (sc.compare = [key A, key B]), or null.
+function comparisonOf(sc) {
+  const [ka, kb] = sc.compare || [], valid = rawResults(sc).filter(r => r.verdict !== "INVALID");
+  const A = valid.find(r => resKey(r) === ka), B = valid.find(r => resKey(r) === kb);
+  if (!A || !B) return null;
+  const {rows, diffs} = compare(A, B);
+  return {a: {test: A.test, direction: A.direction}, b: {test: B.test, direction: B.direction}, differences: diffs,
+          rows: rows.map(({what, va, vb, diff, pair}) => ({what, a: va, b: vb, different: diff, pair}))};
 }
 function run() {
   save();
@@ -709,7 +801,20 @@ async function current() {
           ...st, compare: [cmpA, cmpB], exported: new Date().toISOString(),
           report: {account: T.report.account, generated: T.report.generated, groups: T.groups.map(g => g.id),
                    rule_data_sha256: await fingerprint},
-          results: evaluate(st)};
+          results: evaluate(st), comparison: comparisonOf({...st, compare: [cmpA, cmpB]})};
+}
+// A copy of this page that opens on scenario `sc` (focus "compare" scrolls to the comparison).
+function exportHtml(sc, file) {
+  const doc = document.documentElement.cloneNode(true);
+  doc.querySelector("#app").innerHTML = "";
+  doc.querySelectorAll("#scenario").forEach(x => x.remove());
+  const tag = document.createElement("script");
+  tag.id = "scenario"; tag.type = "application/json";
+  tag.textContent = JSON.stringify(sc).replace(/<\//g, "<\\/");
+  doc.querySelector("#extra-data").after(tag);
+  doc.querySelector("title").textContent = `${sc.focus === "compare" ? "Comparison" : "Scenario"}` +
+    `${sc.name ? ": " + sc.name : ""} - ${document.title}`;
+  download(file, "<!doctype html>\n" + doc.outerHTML, "text/html");
 }
 const slug = s => (s || "scenario").replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60);
 function download(name, text, type) {
@@ -729,7 +834,12 @@ async function evidence(sc, how) {
     now === then ? B("ok", `results reproduced: ${(sc.results || []).length} result(s) identical`)
       : B("error", "results differ from the exported results"),
     unknown.length ? B("error", `${unknown.length} switched-off group(s)/rule(s) not in this report: ${unknown.join(", ")}`) : "",
+    sc.comparison ? (JSON.stringify(comparisonOf(sc)) === JSON.stringify(sc.comparison)
+      ? B("ok", "comparison reproduced") : B("error", "comparison differs from the exported comparison")) : "",
   ].filter(Boolean).join(" ");
+  const cmpText = sc.comparison ? `Comparison: A = ${sc.comparison.a.test} (${sc.comparison.a.direction}), B = ` +
+    `${sc.comparison.b.test} (${sc.comparison.b.direction}): ` + (sc.comparison.differences
+      ? `${sc.comparison.differences} difference(s) when exported` : "same outcome when exported, no differences other than the addresses") : "";
   const offG = sc.groups_off || [], offR = sc.rules_off || [];
   const offText = !offG.length && !offR.length ? "nothing: every rule of every group is on"
     : [...offG.map(g => `group ${g}`), ...offR.map(r => { const x = rules.find(y => y.id === r);
@@ -742,21 +852,29 @@ async function evidence(sc, how) {
       generated ${esc((sc.report || {}).generated || "?")}. Rule data SHA-256 ${esc(fp || "n/a")}.</div>
     <div style="margin:6px 0">Exported results: ${cnt("ALLOWED")} allowed, ${cnt("PARTIAL")} partial,
       ${cnt("DENIED")} denied, ${cnt("INVALID")} invalid.</div>
+    ${cmpText ? `<div style="margin:6px 0">${esc(cmpText)}</div>` : ""}
     <div style="margin:6px 0">${checks}</div>
     <div><strong>Switched off:</strong> ${esc(offText)}</div>
     <div class="muted" style="margin-top:6px">${esc(SCOPE)}</div></div>`;
 }
 $("exphtml").addEventListener("click", async () => {
   const sc = await current();
-  const doc = document.documentElement.cloneNode(true);
-  doc.querySelector("#app").innerHTML = "";
-  doc.querySelectorAll("#scenario").forEach(x => x.remove());
-  const tag = document.createElement("script");
-  tag.id = "scenario"; tag.type = "application/json";
-  tag.textContent = JSON.stringify(sc).replace(/<\//g, "<\\/");
-  doc.querySelector("#extra-data").after(tag);
-  doc.querySelector("title").textContent = `Scenario${sc.name ? ": " + sc.name : ""} - ${document.title}`;
-  download(`sg_scenario_${slug(sc.name)}.html`, "<!doctype html>\n" + doc.outerHTML, "text/html");
+  exportHtml(sc, `sg_scenario_${slug(sc.name)}.html`);
+});
+$("cmphtml").addEventListener("click", async () => {
+  const sc = await current();
+  if (!sc.comparison) return;
+  if (!sc.name) sc.name = `${sc.comparison.a.test} vs ${sc.comparison.b.test}`;
+  sc.focus = "compare";
+  exportHtml(sc, `sg_comparison_${slug(sc.name)}.html`);
+});
+$("cmpcsv").addEventListener("click", async () => {
+  const c = (await current()).comparison;
+  if (!c) return;
+  const q = v => { v = Array.isArray(v) ? v.join("; ") : String(v ?? ""); return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; };
+  const lines = [["what", `A: ${c.a.test} (${c.a.direction})`, `B: ${c.b.test} (${c.b.direction})`, "different"].map(q).join(",")]
+    .concat(c.rows.map(r => [r.what, r.a, r.pair ? r.b : "(same for both)", r.different ? "yes" : ""].map(q).join(",")));
+  download(`sg_comparison_${slug(c.a.test + "_vs_" + c.b.test)}.csv`, lines.join("\n"), "text/csv");
 });
 $("expjson").addEventListener("click", async () =>
   download(`sg_scenario_${slug($("sname").value)}.json`, JSON.stringify(await current(), null, 2), "application/json"));
@@ -801,7 +919,8 @@ if (embedded) {
   if (shared && !fromHash) setState(shared);
 }
 run();
-if (shared) evidence(shared, fromHash ? "embedded in this file; the view below comes from the URL" : "embedded in this file");
+if (shared) evidence(shared, fromHash ? "embedded in this file; the view below comes from the URL" : "embedded in this file")
+  .then(() => { if (shared.focus === "compare" && !fromHash) $("evidence").scrollIntoView(); });
 })();
 """
 
@@ -865,6 +984,28 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], tester
          "uniq": [["access", "protocol/ports"], ["granted_by", "groups"]],
          "sort": [["direction", 1], ["access", 1]]},
     ]
+    d = payload["interface_deltas"]
+    if len(d["interfaces"]) >= 2:
+        tables.insert(0, {
+            "id": "d", "title": "Interface differences", "row_label": "differences",
+            "note": f"Access allowed on some of the {len(d['interfaces'])} interfaces but not on others. Each interface's "
+                    "access is the union of its groups' rules, compared exactly (the same access written differently "
+                    "is not a difference). Rules = the rules on the allowing interfaces that grant it. "
+                    + ("No differences: every interface allows exactly the same access." if not d["access"] else ""),
+            "columns": [["direction", "Direction"], ["access", "Protocol/ports"], ["addresses", "CIDRs / references"],
+                        ["allowed_on", "Allowed on"], ["missing_on", "Not allowed on"], ["rules", "Rules"]],
+            "rows": d["access"], "filters": ["direction", "access", "allowed_on", "missing_on"],
+            "wrap": ["addresses", "rules", "allowed_on", "missing_on"], "order": {"direction": ["ingress", "egress"]},
+            "uniq": [["access", "protocol/ports"], ["missing_on", "interfaces missing access"]],
+            "by": {"key": "missing_on", "label": "By interface missing access", "badge": None},
+            "sort": [["direction", 1], ["access", 1]]})
+        if d["groups"]:
+            tables.insert(0, {
+                "id": "ga", "title": "Group attachment differences", "row_label": "groups",
+                "note": "Groups attached to some of the interfaces but not all.",
+                "columns": [["group_id", "Group"], ["attached_to", "Attached to"], ["missing_on", "Not attached to"]],
+                "rows": d["groups"], "filters": ["missing_on"], "wrap": ["attached_to", "missing_on"],
+                "sort": [["group_id", 1]]})
     if payload["interfaces"]:
         tables.insert(0, {"id": "i", "title": "Interfaces", "row_label": "interfaces",
                           "columns": [["eni_id", "Interface"], ["attachment", "Attached to"], ["vpc_id", "VPC"],
@@ -878,6 +1019,8 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], tester
              (sum(r.direction == "egress" for r in rows), "egress rules"),
              (sum(r.also_granted == "fully" for r in rows), "fully overlapped rules"),
              (len({g["vpc_id"] for g in gs}), "VPCs")]
+    if len(d["interfaces"]) >= 2:
+        cards.append((len(d["access"]), "interface access differences"))
     return html_report.render("Security group rule inventory", meta=meta, cards=cards, tables=tables,
                               extra_html=TESTER_HTML, extra_script=TESTER_JS,
                               extra_data=tester_text)
@@ -887,7 +1030,7 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], tester
 # CLI
 # --------------------------------------------------------------------------- #
 def main() -> int:
-    """Command-line entry point. Returns 0 ok, 1 a prefix list could not be read, 2 fatal."""
+    """Command-line entry point. Returns 0 ok, 1 interfaces differ or a prefix list could not be read, 2 fatal."""
     p = argparse.ArgumentParser(
         description="Report every rule of a set of security groups (or the groups on network interfaces), "
                     "and their combined access, with an interactive traffic tester in the HTML report. Read-only.",
@@ -953,7 +1096,8 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
                "generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                "interfaces": interfaces, "warnings": warnings,
                "groups": [{**asdict(g), "via": via.get(g.group_id, [])} for g in groups],
-               "rules": [asdict(r) for r in rows], "combined_access": combined}
+               "rules": [asdict(r) for r in rows], "combined_access": combined,
+               "interface_deltas": interface_deltas(interfaces, rules)}
     tester_text, payload["rule_data_sha256"] = tester_data(payload, groups, rules, pls)
 
     slug = groups[0].group_id if len(groups) == 1 else f"{groups[0].group_id}_and_{len(groups) - 1}_more"
@@ -972,7 +1116,8 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
     else:
         print_report(payload, rows, combined)
         print_saved(paths)
-    return 1 if warnings else 0
+    deltas = payload["interface_deltas"]
+    return 1 if warnings or deltas["groups"] or deltas["access"] else 0
 
 
 if __name__ == "__main__":
