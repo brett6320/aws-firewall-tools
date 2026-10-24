@@ -383,6 +383,11 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_
 
 
 TESTER_HTML = """
+<style>
+/* this report uses the full window; the comparison table always fits it, long values wrap in their cells */
+body{max-width:none}
+table.cmp{table-layout:fixed;width:100%}table.cmp th,table.cmp td{white-space:normal;overflow-wrap:anywhere}
+</style>
 <section id="tester"><h2>Access tester</h2>
 <div data-t="evidence"></div>
 <div class="muted">Checks flows against the combined rules switched on below, using the rule data in this file
@@ -426,7 +431,7 @@ differ from the baseline are highlighted.</div>
 <div style="flex:1 1 100%"><span class="muted" style="font-size:11px">Compare with:</span>
 <button data-t="cwall">All</button> <button data-t="cwnone">None</button>
 <div data-t="cwith" style="display:flex;flex-wrap:wrap;gap:2px 14px;margin-top:4px"></div></div></div>
-<div class="wrap"><table data-t="cmp"></table></div>
+<table class="cmp" data-t="cmp"></table>
 </section>
 """
 
@@ -713,7 +718,9 @@ function comparisonTableHtml(m) {
   const cell = v => Array.isArray(v) ? v.map(esc).join("<br>") : esc(v);
   const show = (what, v) => what === "Verdict" && BADGE[v] ? `<span class="badge ${BADGE[v]}">${v}</span>` : cell(v);
   const hl = ' style="background:var(--warn-bg)"';
-  return `<tr><th></th><th>Baseline: ${esc(m.baseline.test)}</th>` +
+  // fixed layout: the label column gets a set width, the baseline and each compared test share the rest
+  return `<colgroup><col style="width:12em">${"<col>".repeat(m.against.length + 1)}</colgroup>` +
+    `<tr><th></th><th>Baseline: ${esc(m.baseline.test)}</th>` +
     m.against.map(b => `<th>${esc(b.test)}</th>`).join("") + `</tr>` +
     `<tr><td></td><td></td>` + m.against.map(b => `<td>${b.differences
       ? `<span class="badge warn">${b.differences} difference(s)</span>` : `<span class="badge ok">same outcome</span>`}</td>`).join("") +
@@ -938,11 +945,11 @@ function comparisonPage(sc) {
 @media (prefers-color-scheme:dark){:root{--bg:#0f1418;--fg:#e3e8ec;--muted:#97a3ad;--line:#2c353d;--card:#161d23;
 --error:#ff8a80;--error-bg:#3d1714;--warn:#f2c14e;--warn-bg:#3a2e0e;--info:#8ab4f8;--info-bg:#14243b;--ok:#6fdc8c;--ok-bg:#12321e}}
 body{background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-margin:0 auto;padding:24px 16px;max-width:1200px}h1{font-size:22px;margin:0 0 6px}.muted{color:var(--muted)}
+margin:0 auto;padding:24px 16px}h1{font-size:22px;margin:0 0 6px}.muted{color:var(--muted)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:12px 0}
 table{border-collapse:collapse;width:100%;margin:8px 0}th,td{text-align:left;vertical-align:top;padding:6px 8px;
 border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px}td{font:12.5px ui-monospace,Menlo,Consolas,monospace}
-td.nw{white-space:nowrap}.wrap{overflow-x:auto}.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+table.cmp{table-layout:fixed;width:100%}table.cmp th,table.cmp td{white-space:normal;overflow-wrap:anywhere}.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
 font-weight:600;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
 .error{color:var(--error);background:var(--error-bg)}.warn{color:var(--warn);background:var(--warn-bg)}
 .info{color:var(--info);background:var(--info-bg)}.ok{color:var(--ok);background:var(--ok-bg)}
@@ -955,7 +962,7 @@ generated ${esc(r.generated || "?")}. Source rule data SHA-256 ${esc(r.rule_data
 <b>Compared:</b> ${c.against.length} test(s): ${nd ? `<span class="badge warn">${nd} differ</span>` : ""}
 ${c.against.length - nd ? `<span class="badge ok">${c.against.length - nd} same outcome</span>` : ""}</div>
 <div style="margin-top:6px"><b>Switched off:</b> ${esc(off)}</div></div>
-<div class="wrap"><table>${comparisonTableHtml(c)}</table></div>
+<table class="cmp">${comparisonTableHtml(c)}</table>
 <div class="muted">Addresses are ignored: the comparison covers verdict, the protocol / ports allowed (on the protocol /
 ports both tests cover) and the rules involved. ${esc(SCOPE)}</div>
 <div class="muted" style="margin-top:6px">To verify: open the full report with the same rule data SHA-256 and load this file
