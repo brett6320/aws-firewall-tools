@@ -117,7 +117,7 @@ covers (`×3`).
 - Results that cover only part of an address keep the exact CIDRs. They share a row only when they are identical.
 - Tests in a row may be granted by different rules. A rule that matches every test in the row is listed plainly; any other rule names the tests it matches, `(for in 10.200.0.1 tcp 443)`.
 
-**Switching groups and rules off.** Every group and rule has a checkbox.
+**Switching groups and rules off.** Every group and rule has a checkbox in the "Groups and rules used by the tester" panel. The panel is collapsed by default; its heading shows how many rules are on.
 Untick one to see what the set would allow without it. "All on" restores
 everything.
 

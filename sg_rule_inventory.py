@@ -298,7 +298,7 @@ port; ICMP port = TYPE[/CODE]; no port = every port, and the result lists the al
 style="font:12.5px ui-monospace,Menlo,Consolas,monospace;width:100%;box-sizing:border-box;color:var(--fg);
 background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px"></textarea></label>
 </div>
-<details class="controls" style="display:block" data-t="tgl" open><summary style="cursor:pointer">
+<details class="controls" style="display:block" data-t="tgl"><summary style="cursor:pointer">
 Groups and rules used by the tester: <b data-t="oncount"></b>
 <button data-t="allon">All on</button></summary>
 <div class="muted" style="margin:6px 0">Untick a group or a rule to see the effect of removing it.</div>
