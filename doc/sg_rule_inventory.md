@@ -145,19 +145,19 @@ covers (`×3`).
 - Results that cover only part of an address keep the exact CIDRs. They share a row only when they are identical.
 - Tests in a row may be granted by different rules. A rule that matches every test in the row is listed plainly; any other rule names the tests it matches, `(for in 10.200.0.1 tcp 443)`.
 
-**Comparing two tests.** Under the results, pick test A and test B. For a `both` test, each direction is its own choice. The comparison ignores the addresses and shows:
-- direction and verdict of each;
-- the protocol / ports both tests cover, which is what is compared. Anything only one test covers is listed as not compared;
-- the protocols / ports allowed for both, and in one row, those allowed only for A (under A) and only for B (under B). "Allowed" means for every tested address; ports allowed for only part of a CIDR are listed separately;
-- the granting rules, and switched-off rules that would match, for both, only A, and only B, within the compared protocol / ports.
+**Comparing tests with a baseline.** Under the results, pick a **baseline** test and tick the tests to compare with it (all other tests by default; "All" / "None" to switch). For a `both` test, each direction is its own choice. The table has a column for the baseline and one per compared test, each with its number of differences, or "same outcome". Addresses are ignored. For each compared test it shows:
+- direction and verdict;
+- the protocol / ports compared, which is what the test and the baseline both cover. Anything only one of them covers is listed as not compared;
+- the protocols / ports allowed for both, **allowed for the baseline but not here**, and **allowed here but not for the baseline**. "Allowed" means for every tested address; ports allowed for only part of a CIDR get a row of their own;
+- the granting rules they share, those only for the baseline, and those only here, plus switched-off rules that would match, all within the compared protocol / ports.
 
-Rows that differ are marked, with a count at the top; "same outcome" means nothing differs except the addresses. The selected pair is kept in the URL fragment and in exported scenarios.
+Cells that differ from the baseline are highlighted, and their rows are marked. The baseline and the ticked tests are kept in the URL fragment and in exported scenarios.
 
 To share a comparison:
-- **Download comparison**: a small standalone page with only the comparison: the two tests, the A / B table, the switched-off rules, the source report's account, generation time and rule data SHA-256, and the scope. It holds no rule data, so it is a few KB rather than the size of the report. If no scenario name was given, the name is "A vs B".
-- **Download comparison CSV**: one line per row (what, A, B, different).
+- **Download comparison**: a small standalone page with only the comparison: the baseline, the compared tests, the table, the switched-off rules, the source report's account, generation time and rule data SHA-256, and the scope. It holds no rule data, so it is a few KB rather than the size of the report. If no scenario name was given, the name is "baseline vs N tests".
+- **Download comparison CSV**: one line per row, one column per test; cells that differ from the baseline start with `[differs]`.
 
-The comparison page also carries a compact scenario of just the two tests and the on / off state. To check it, open the full report with the same rule data SHA-256 and load the comparison file with **Import scenario**. The two tests are re-run, the comparison is recomputed and shown, and the evidence panel says whether it matches the file (see [below](#sharing-a-scenario-as-evidence)). The check covers the comparison's data, not hand edits to the visible table, but the verifier always sees the recomputed comparison in the report.
+The comparison page also carries a compact scenario of just the compared tests and the on / off state. To check it, open the full report with the same rule data SHA-256 and load the comparison file with **Import scenario**. The tests are re-run, the comparison is recomputed and shown, and the evidence panel says whether it matches the file (see [below](#sharing-a-scenario-as-evidence)). The check covers the comparison's data, not hand edits to the visible table, but the verifier always sees the recomputed comparison in the report.
 
 **Switching groups and rules off.** Every group and rule has a checkbox in the "Groups and rules used by the tester" panel. The panel is collapsed by default; its heading shows how many rules are on.
 Untick one to see what the set would allow without it. "All on" restores
