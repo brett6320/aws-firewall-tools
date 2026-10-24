@@ -87,7 +87,7 @@ Tools that look inside member accounts scan the accounts you select:
   - `--profile`'s account by default;
   - `--account ID[,ID]` for specific accounts;
   - `--all-accounts` for every account with a local profile.
-- `sg_rule_inventory` reads the accounts named in its ARNs, each through its local profile (`--profile` is used for its own account).
+- `sg_rule_inventory` and `sg_access_gap` read the accounts named in their ARNs, each through its local profile (`--profile` is used for its own account).
 
 Each account's profile comes from the local AWS config (`AWS_CONFIG_FILE` is honoured):
 - A profile's account is its `sso_account_id`, `aws_account_id`, or the account in its `role_arn`.

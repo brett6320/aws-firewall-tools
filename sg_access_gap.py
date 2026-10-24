@@ -10,9 +10,9 @@ written (prefix lists vs. CIDRs, split or merged ranges) are not reported as
 gaps, while real missing access is reported down to the exact CIDRs and ports.
 
 Finds access granted by a "left" security group that the "right" security
-group(s) do not grant. Groups are given as ARNs or group IDs, all in one
-account; the first is the left group and every further group is a right
-group. With several right groups, left access is checked against their
+group(s) do not grant. Groups are given as ARNs or group IDs, in one or more
+accounts (several accounts via ARNs); the first is the left group and every
+further group is a right group. With several right groups, left access is checked against their
 combined access (as if all were attached to the same ENI), so a range split
 across two right groups counts as granted. Ingress and egress are checked
 separately. Access the right groups grant beyond the left is not reported.
@@ -28,6 +28,14 @@ Rules are compared by the access they grant, not by how they are written:
     rules (a prefix list vs. its CIDRs, a /16 vs. two /17s, a broader rule)
   * IDENTICAL (info) when a right group has the same rule
     (protocol, ports and peer; descriptions are ignored)
+
+Accounts: each account is read with its own profile. --profile is used for
+its own account; every other account named by an ARN uses its local profile
+(found by account id; profiles ending in -priv or -cpar are never used;
+--account-profile forces one). Bare ids belong to the --profile account, else
+to the single ARN account, else (no ARNs) to AWS_PROFILE or the default
+credentials; next to ARNs from several accounts they are refused as
+ambiguous. Every profile is verified with sts:GetCallerIdentity first.
 
 Security group references are matched by group ID (a self-reference in the
 left group matches a self-reference in any right group). Prefix lists that
@@ -49,6 +57,7 @@ reports/sg_access_gap/YYYY-MM-DD/.
 Usage:
 
     ./sg_access_gap.py --profile prod-admin LEFT_SG RIGHT_SG [RIGHT_SG ...]
+    ./sg_access_gap.py LEFT_SG_ARN RIGHT_SG_ARN_IN_ANOTHER_ACCOUNT
 
 Exit codes: 0 no gaps, 1 gaps or warnings, 2 fatal error.
 
@@ -76,9 +85,11 @@ truststore.inject_into_ssl()
 import boto3  # noqa: E402
 from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402
 
-from lib.aws_common import get_client  # noqa: E402  (also loads .env, sets up logging)
+from lib.accounts import add_profile_args, check_profile_args  # noqa: E402
+from lib.aws_common import get_client  # noqa: E402,F401  (also loads .env, sets up logging)
 from lib.boxes import Box, fmt_addrs, fmt_proto_ports, intersects, merge, remainder  # noqa: E402
-from lib.security_groups import SG, SgRule, load_groups, parse_targets  # noqa: E402
+from lib.security_groups import (SG, SgRule, load_groups, parse_account_targets,  # noqa: E402
+                                 resolve_account_profiles, split_specs, spec_accounts)
 
 log = logging.getLogger("sg_access_gap")
 
@@ -191,13 +202,18 @@ def load(session_factory, targets: list[tuple[str, str]]):
 # --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
-def print_report(groups: list[SG], rules, findings: list[Finding], summary: list[dict], show_covered: bool) -> None:
-    """Print the text report: groups, warnings, then per direction each gap with its absent
-    access and the overlapping right rules (covered rules only with `show_covered`).
+def print_report(groups: list[SG], rules, findings: list[Finding], summary: list[dict], show_covered: bool,
+                 accounts: list[dict] | None = None) -> None:
+    """Print the text report: accounts, groups, warnings, then per direction each gap with its
+    absent access and the overlapping right rules (covered rules only with `show_covered`).
     """
     print()
+    for a in accounts or []:
+        print(f"account {a['account']} via {('profile ' + a['profile']) if a['profile'] else 'default credentials'} "
+              f"({a['profile_source']})")
+    multi = len({g.owner for g in groups}) > 1
     for i, g in enumerate(groups):
-        print(f"{'left ' if i == 0 else 'right'}  {g}  rules: "
+        print(f"{'left ' if i == 0 else 'right'}  {g}{'  account ' + g.owner if multi else ''}  rules: "
               f"{sum(not r.egress for r in rules[g.group_id])} in / {sum(r.egress for r in rules[g.group_id])} out")
     for f in (f for f in findings if not f.left):
         print(f"[{f.severity.upper():<5}] {f.code} {f.detail}")
@@ -294,12 +310,13 @@ def render_html(payload: dict, generated: str) -> str:
     out.append("<div class='card stats'>" + "".join(
         f"<span><b>{e(k)}</b> {v}</span>" for k, v in sorted(counts.items())) + "</div>")
 
-    out.append("<h2>Groups</h2><div class='wrap'><table><tr><th>Role</th><th>Group</th><th>Name</th><th>VPC</th>"
+    out.append("<h2>Groups</h2><div class='wrap'><table><tr><th>Role</th><th>Group</th><th>Name</th><th>Account</th><th>VPC</th>"
                "<th>Region</th><th>Ingress rules</th><th>Egress rules</th></tr>")
     for i, g in enumerate(payload["groups"]):
         rs = payload["rules"][g["group_id"]]
         out.append(f"<tr><td>{'left' if i == 0 else 'right'}</td><td class='mono'>{e(g['group_id'])}</td>"
-                   f"<td>{e(g['name'])}</td><td class='mono'>{e(g['vpc_id'])}</td><td>{e(g['region'])}</td>"
+                   f"<td>{e(g['name'])}</td><td class='mono'>{e(g['owner'])}</td><td class='mono'>{e(g['vpc_id'])}</td>"
+                   f"<td>{e(g['region'])}</td>"
                    f"<td>{sum(not r['egress'] for r in rs)}</td><td>{sum(r['egress'] for r in rs)}</td></tr>")
     out.append("</table></div>")
 
@@ -377,11 +394,16 @@ def main() -> int:
   %(prog)s --profile prod-admin sg-0123456789abcdef0 sg-0fedcba9876543210
   %(prog)s --profile prod-admin arn:aws:ec2:us-east-1:111122223333:security-group/sg-0123456789abcdef0 \\
            arn:aws:ec2:us-west-2:111122223333:security-group/sg-0fedcba9876543210
+  %(prog)s arn:aws:ec2:us-east-1:111122223333:security-group/sg-0123456789abcdef0 \\
+           arn:aws:ec2:us-east-1:444455556666:security-group/sg-0fedcba9876543210
 """)
     p.add_argument("groups", nargs="+", metavar="SG",
                    help="Security group ARNs or ids (comma-separated also accepted): LEFT RIGHT [RIGHT ...]; "
-                        "left access is checked against the right groups' combined access")
-    p.add_argument("--profile", default=os.getenv("AWS_PROFILE") or None, help="AWS profile (default AWS_PROFILE)")
+                        "left access is checked against the right groups' combined access. ARNs may name "
+                        "different accounts")
+    p.add_argument("--profile", default=None,
+                   help="AWS profile, used for its own account (and for bare ids). Other accounts named by "
+                        "ARNs use their local profiles (never -priv/-cpar); with no ARNs, default AWS_PROFILE")
     p.add_argument("--region", default=os.getenv("AWS_REGION") or None,
                    help="Region for bare group ids (default AWS_REGION, then the profile's region)")
     p.add_argument("--show-covered", action="store_true",
@@ -395,7 +417,9 @@ def main() -> int:
     p.add_argument("--no-save", action="store_true", help="Do not auto-save reports")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("-q", "--quiet", action="store_true")
+    add_profile_args(p)
     args = p.parse_args()
+    check_profile_args(p, args)
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -403,16 +427,27 @@ def main() -> int:
         logging.getLogger().setLevel(logging.WARNING)
 
     try:
-        base_session = boto3.Session(profile_name=args.profile)
-        targets, account = parse_targets(args.groups, args.region or base_session.region_name)
-        caller = get_client("sts", boto3.Session(profile_name=args.profile,
-                                                 region_name=targets[0][0])).get_caller_identity()["Account"]
-        if account and caller != account:
-            raise ValueError(f"profile {args.profile or '(default)'} is account {caller}; groups are in {account}")
-        groups, rules, findings = load(lambda r: boto3.Session(profile_name=args.profile, region_name=r), targets)
-        owners = {g.owner for g in groups}
-        if len(owners) > 1:
-            raise ValueError(f"security groups must be in one account; owners: {', '.join(sorted(owners))}")
+        arn_accounts = spec_accounts(args.groups)
+        bare_ids = any(not t.startswith("arn:") for t in split_specs(args.groups))
+        profiles, bare_account = resolve_account_profiles(args, arn_accounts, bare_ids)
+        default_region = args.region or (boto3.Session(profile_name=profiles[bare_account][0]).region_name
+                                         if bare_account else None)
+        targets = [(a or bare_account, r, gid) for a, r, gid in
+                   parse_account_targets(args.groups, default_region, allow_workloads=False)]
+        if len(targets) < 2:
+            raise ValueError("need at least two distinct security groups")
+        for account, (profile, source) in sorted(profiles.items()):
+            log.info("Account %s via %s (%s)", account, profile or "default credentials", source)
+        # each account read with its own profile; groups keep argument order (first = left)
+        by_id, rules, findings = {}, {}, []
+        for account in dict.fromkeys(a for a, _, _ in targets):
+            profile = profiles[account][0]
+            gs, rs, fs = load(lambda r, profile=profile: boto3.Session(profile_name=profile, region_name=r),
+                              [(r, gid) for a, r, gid in targets if a == account])
+            by_id.update({g.group_id: g for g in gs})
+            rules.update(rs)
+            findings += fs
+        groups = [by_id[gid] for _, _, gid in targets]
     except ValueError as e:
         log.error("%s", e)
         return 2
@@ -425,10 +460,16 @@ def main() -> int:
     if len({g.vpc_id for g in groups}) > 1:
         findings.insert(0, Finding("info", "DIFFERENT_VPCS",
                                    detail="groups are in different VPCs; group references may not be comparable"))
+    if len({g.owner for g in groups}) > 1:
+        findings.insert(0, Finding("info", "DIFFERENT_ACCOUNTS",
+                                   detail=f"groups are in {len({g.owner for g in groups})} accounts; group references "
+                                          "are matched by group id"))
+    used = sorted({g.owner for g in groups})
+    accounts = [{"account": a, "profile": profiles[a][0], "profile_source": profiles[a][1]} for a in used if a in profiles]
     by_code = defaultdict(int)
     for f in findings:
         by_code[f.code] += 1
-    payload = {"account": caller, "groups": [asdict(g) for g in groups], "summary": summary,
+    payload = {"account": ", ".join(used), "accounts": accounts, "groups": [asdict(g) for g in groups], "summary": summary,
                "stats": dict(by_code),
                "rules": {g.group_id: [{**{k: v for k, v in asdict(r).items() if k != "boxes"}, "rule": str(r)}
                                       for r in rules[g.group_id]] for g in groups},
@@ -448,7 +489,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        print_report(groups, rules, findings, summary, args.show_covered)
+        print_report(groups, rules, findings, summary, args.show_covered, accounts)
         saved = [x for x in (html_path, csv_path, json_path) if x]
         if saved:
             print("\nSaved:\n" + "\n".join(f"  {x}" for x in saved))
