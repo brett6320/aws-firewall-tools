@@ -25,6 +25,7 @@ Table spec (dict):
   filters   keys with a dropdown
   uniq      [[key, label], ...] columns to count unique values of
   wrap      keys whose text wraps (others stay on one line)
+  lines     keys whose list values show one item per line (default: comma-separated)
   badges    {key: {value: css class}}; classes: error, warn, info, ok
   order     {key: [values in sort order]} (e.g. severity)
   sort      initial sort, [[key, 1 | -1], ...]
@@ -100,6 +101,7 @@ function makeTable(t) {
   app.appendChild(sec);
   const LABEL = Object.fromEntries(t.columns);
   const filters = t.filters || [], wrap = t.wrap || [], badges = t.badges || {}, order = t.order || {};
+  const lines = t.lines || [];
   const hide = t.hide, P = t.id + ".";
   const st = {q: "", show: false, f: {}, sort: (t.sort || []).map(x => [...x])};
   filters.forEach(k => { if (H.get(P + k)) st.f[k] = H.get(P + k); });
@@ -160,7 +162,7 @@ function makeTable(t) {
     const vs = vals(v), f = filters.includes(k) && vs.length === 1;
     const cls = [wrap.includes(k) ? "" : "nw", f ? "f" : ""].filter(Boolean).join(" ");
     return `<td class="${cls}"${f ? ` data-k="${esc(k)}" data-v="${esc(vs[0])}"` : ""}>` +
-      (Array.isArray(v) ? v.map(x => badge(k, String(x))).join(", ") : badge(k, txt(v))) + `</td>`;
+      (Array.isArray(v) ? v.map(x => badge(k, String(x))).join(lines.includes(k) ? "<br>" : ", ") : badge(k, txt(v))) + `</td>`;
   };
   function render() {
     saveHash();
