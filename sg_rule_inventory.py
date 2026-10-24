@@ -30,7 +30,7 @@ What it does:
      it, and the switched-off rules that would. Without PORT, or for a
      partial result, the allowed and not-allowed ports / addresses are listed.
      Groups and individual rules can be switched off to see their effect.
-     Tests with identical results share a row. A scenario (tests, switched-off
+     Tests with identical outcomes share a row. A scenario (tests, switched-off
      rules, name, notes) can be downloaded as a copy of the report that opens
      on it, or exported / imported as JSON, to show others that a path is open:
      on opening, the copy re-runs the tests, compares them with the exported
@@ -298,7 +298,7 @@ port; ICMP port = TYPE[/CODE]; no port = every port, and the result lists the al
 style="font:12.5px ui-monospace,Menlo,Consolas,monospace;width:100%;box-sizing:border-box;color:var(--fg);
 background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px"></textarea></label>
 </div>
-<details class="controls" style="display:block" data-t="tgl" open><summary style="cursor:pointer">
+<details class="controls" style="display:block" data-t="tgl"><summary style="cursor:pointer">
 Groups and rules used by the tester: <b data-t="oncount"></b>
 <button data-t="allon">All on</button></summary>
 <div class="muted" style="margin:6px 0">Untick a group or a rule to see the effect of removing it.</div>
@@ -583,20 +583,28 @@ function run() {
   const res = lines.flatMap(l => runLine(l, on));
   const n = v => res.filter(r => r.verdict === v).length;
   const rows = new Map();
-  res.forEach(r => { const k = JSON.stringify([r.direction, r.verdict, r.detail, r.by, r.off, r.okN, r.remN]);
+  // grouped by outcome only: which rules grant it may differ between the tests of a row
+  res.forEach(r => { const k = JSON.stringify([r.direction, r.verdict, r.detail, r.okN, r.remN]);
     (rows.get(k) || rows.set(k, []).get(k)).push(r); });
   $("cards").innerHTML = [[res.length, "results"], [rows.size, "distinct results"], [n("ALLOWED"), "allowed"], [n("PARTIAL"), "partial"],
     [n("DENIED"), "denied"], [n("INVALID"), "invalid"], [on.size, "rules on"]]
     .map(([v, l]) => `<div class="card"><b>${v}</b><span>${l}</span></div>`).join("");
   const ul = xs => xs.length ? xs.map(esc).join("<br>") : "";
-  // tests with identical results share a row; a single test keeps its literal addresses
+  // Rules matching every test of a row are listed plainly; others name the tests they match.
+  const attributed = (g, key) => {
+    const per = new Map();
+    g.forEach(x => x[key].forEach(t => (per.get(t) || per.set(t, []).get(t)).push(x.test)));
+    return [...per].map(([t, ts]) => ts.length === g.length ? esc(t)
+      : `${esc(t)} <span class="muted">(for ${ts.map(esc).join(", ")})</span>`).join("<br>");
+  };
+  // tests with identical outcomes share a row; a single test keeps its literal addresses
   $("out").innerHTML = res.length ? `<tr><th>Tests</th><th>Direction</th><th>Verdict</th><th>Allowed</th>` +
     `<th>Not allowed</th><th>Granted by</th><th>Switched-off rules that match</th></tr>` + [...rows.values()].map(g => {
     const r = g[0], one = g.length === 1;
     return `<tr><td class="nw">${ul(g.map(x => x.test))}</td><td>${esc(r.direction)}</td>` +
       `<td><span class="badge ${BADGE[r.verdict]}">${r.verdict}</span>${one ? "" : ` <span class="muted">&times;${g.length}</span>`}</td>` +
       `<td>${ul(one ? r.ok : r.okN)}</td><td>${r.detail ? esc(r.detail) : ul(one ? r.rem : r.remN)}</td>` +
-      `<td>${ul(r.by)}</td><td>${ul(r.off)}</td></tr>`; }).join("") : "";
+      `<td>${attributed(g, "by")}</td><td>${attributed(g, "off")}</td></tr>`; }).join("") : "";
 }
 // --- scenarios: export for others, import, evidence check ---
 const dataText = document.getElementById("extra-data").textContent;

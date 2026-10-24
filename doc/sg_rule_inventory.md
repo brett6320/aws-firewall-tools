@@ -110,12 +110,14 @@ Each result shows:
 | Granted by | The switched-on rules that match the traffic |
 | Switched-off rules that match | Rules that are switched off but would have matched |
 
-Tests with identical results share one row, and the verdict shows how many
-tests the row covers (`×3`).
-- A test's own address appears as `(tested address)`. So `in 10.1.2.3 tcp` and `in 10.1.2.4 tcp` share a row when the same ports are allowed for both, through the same rules.
+Tests with identical outcomes share one row: same direction, same verdict, and
+the same allowed / not-allowed ports. The verdict shows how many tests the row
+covers (`×3`).
+- A test's own address appears as `(tested address)`. So `in 10.1.2.3 tcp` and `in 10.1.2.4 tcp` share a row when the same ports are allowed for both.
 - Results that cover only part of an address keep the exact CIDRs. They share a row only when they are identical.
+- Tests in a row may be granted by different rules. A rule that matches every test in the row is listed plainly; any other rule names the tests it matches, `(for in 10.200.0.1 tcp 443)`.
 
-**Switching groups and rules off.** Every group and rule has a checkbox.
+**Switching groups and rules off.** Every group and rule has a checkbox in the "Groups and rules used by the tester" panel. The panel is collapsed by default; its heading shows how many rules are on.
 Untick one to see what the set would allow without it. "All on" restores
 everything.
 
