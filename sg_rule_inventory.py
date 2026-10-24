@@ -30,7 +30,9 @@ What it does:
      it, and the switched-off rules that would. Without PORT, or for a
      partial result, the allowed and not-allowed ports / addresses are listed.
      Groups and individual rules can be switched off to see their effect.
-     Tests with identical outcomes share a row. A scenario (tests, switched-off
+     Tests with identical outcomes share a row. Any two results can be
+     compared: verdict, ports allowed for both / only one, and the rules
+     involved, ignoring the addresses. A scenario (tests, switched-off
      rules, name, notes) can be downloaded as a copy of the report that opens
      on it, or exported / imported as JSON, to show others that a path is open:
      on opening, the copy re-runs the tests, compares them with the exported
@@ -312,6 +314,12 @@ placeholder="change ticket, purpose, assumptions"></label>
 </div>
 <div class="cards" data-t="cards"></div>
 <div class="wrap"><table data-t="out"></table></div>
+<h3>Compare two tests</h3>
+<div class="muted">Differences between two results other than their addresses: verdict, the protocols / ports
+allowed (compared on the protocol / ports both tests cover), and the rules involved.</div>
+<div class="controls"><label>Test A<select data-t="ca" style="max-width:420px"></select></label>
+<label>Test B<select data-t="cb" style="max-width:420px"></select></label><button data-t="swap">Swap</button></div>
+<div class="wrap"><table data-t="cmp"></table></div>
 </section>
 """
 
@@ -466,6 +474,16 @@ function merge3(boxes) {
   }
   return bs;
 }
+// Protocol / port intervals [[pr, ports]] as text, ports listed per protocol: "tcp 22, 443; udp 53".
+function ppText(pps) {
+  pps = [...pps].sort((x, y) => big(x[0][0], y[0][0]) || big(x[1][0], y[1][0]));
+  const protos = new Map();
+  pps.forEach(([pr, o]) => {
+    const t = fmtPP(pr, o), m = /^(tcp|udp|icmp|icmpv6) (.*)$/.exec(t);
+    if (m) (protos.get(m[1]) || protos.set(m[1], []).get(m[1])).push(m[2]); else protos.set(t, null);
+  });
+  return [...protos].map(([n, ps]) => ps ? `${n} ${ps.join(", ")}` : n).join("; ");
+}
 // Pieces [[space, box]] as text, ports listed per protocol for each address set:
 // "tcp 22, 443, 8000-8100; udp 53 from 10.1.2.3/32".
 function describe(pieces, prep) {
@@ -478,13 +496,7 @@ function describe(pieces, prep) {
   }
   const byText = new Map();
   for (const e of byAddr.values()) {
-    e.pp.sort((x, y) => big(x[0][0], y[0][0]) || big(x[1][0], y[1][0]));
-    const protos = new Map();
-    e.pp.forEach(([pr, o]) => {
-      const t = fmtPP(pr, o), m = /^(tcp|udp|icmp|icmpv6) (.*)$/.exec(t);
-      if (m) (protos.get(m[1]) || protos.set(m[1], []).get(m[1])).push(m[2]); else protos.set(t, null);
-    });
-    const text = [...protos].map(([n, ps]) => ps ? `${n} ${ps.join(", ")}` : n).join("; ");
+    const text = ppText(e.pp);
     (byText.get(text) || byText.set(text, []).get(text)).push(...cidrs(e.s, e.iv[0], e.iv[1]));
   }
   return [...byText].map(([t, a]) => `${t} ${prep} ${a.join(", ")}`);
@@ -500,12 +512,13 @@ function runLine(line, on) {
                        detail: String(e)}]; }
   const noPort = parts.length === 3;
   return DIRS[parts[0].toLowerCase()].map(dir => {
-    const rs = rules.filter(r => r.dir === dir), hits = new Map(), offHits = new Map(), rem = [], ok = [];
+    const rs = rules.filter(r => r.dir === dir), hits = new Map(), offHits = new Map(), rem = [], ok = [], matched = [];
     for (const a of addrs) {
       const box = [pp[0], pp[1], [a.lo, a.hi]], cover = [];
       for (const r of rs) for (const x of r.bx) {
         if (x.s !== a.space || !inter(box, x.b)) continue;
         if (on.has(r.key)) { cover.push(x.b); hits.set(r.key, r); } else offHits.set(r.key, r);
+        matched.push({t: ruleText(r), on: on.has(r.key), b: [x.b[0], x.b[1]].map((iv, i) => [iv[0] > box[i][0] ? iv[0] : box[i][0], iv[1] < box[i][1] ? iv[1] : box[i][1]])});
       }
       let pieces = [box];
       for (const c of cover) { pieces = pieces.flatMap(p => sub(p, c)); if (!pieces.length) break; }
@@ -523,10 +536,80 @@ function runLine(line, on) {
     const norm = xs => xs.map(x => { const i = x.lastIndexOf(` ${prep} `), as = x.slice(i + prep.length + 2).split(", ");
       return i >= 0 && as.length === own.size && as.every(a => own.has(a)) ? `${x.slice(0, i)} ${prep} (tested address)` : x; });
     return {test: line, direction: dir, verdict, detail: "", by: [...hits.values()].map(ruleText),
-            off: [...offHits.values()].map(ruleText), ok: okT, rem: remT, okN: norm(okT), remN: norm(remT)};
+            off: [...offHits.values()].map(ruleText), ok: okT, rem: remT, okN: norm(okT), remN: norm(remT),
+            pp, okB: ok, remB: rem, matched};
   });
 }
 const ruleText = r => `${r.g} ${r.id} ${r.text}` + (r.desc ? ` "${r.desc}"` : "");
+
+// --- comparing two results, ignoring their addresses ---
+const NOADDR = [0n, 0n];
+const minus = (xs, ys) => xs.flatMap(x => { let p = [x];
+  for (const y of ys) { p = p.flatMap(q => sub(q, y)); if (!p.length) break; } return p; });
+const isect = (a, b) => inter(a, b) ? a.map((x, i) => [x[0] > b[i][0] ? x[0] : b[i][0], x[1] < b[i][1] ? x[1] : b[i][1]]) : null;
+const isectAll = (xs, ys) => xs.flatMap(x => ys.map(y => isect(x, y)).filter(Boolean));
+const disjoint = xs => xs.reduce((acc, x) => acc.concat(minus([x], acc)), []);
+const ppOf = bs => bs.length ? ppText(merge3(bs).map(b => [b[0], b[1]])) : "";
+// Protocol / ports allowed for every tested address (all), and for only some of them (partial).
+function coverage(r) {
+  const tested = [r.pp[0], r.pp[1], NOADDR];
+  const all = minus([tested], r.remB.map(([, b]) => [b[0], b[1], NOADDR]));
+  return {tested, all, partial: minus(disjoint(r.okB.map(([, b]) => [b[0], b[1], NOADDR])), all)};
+}
+function compare(A, B) {
+  const a = coverage(A), b = coverage(B), C = isect(a.tested, b.tested), rows = [];
+  let diffs = 0;
+  // pair = show A and B side by side; otherwise one value spanning both columns
+  const add = (what, va, vb, diff, pair = vb !== "") => { rows.push({what, va, vb, diff, pair}); if (diff) diffs++; };
+  add("Direction", A.direction, B.direction, A.direction !== B.direction, true);
+  add("Verdict", A.verdict, B.verdict, A.verdict !== B.verdict, true);
+  if (!C) {
+    add("Protocol / ports compared", "none in common", "", false);
+  } else {
+    const ca = isectAll(a.all, [C]), cb = isectAll(b.all, [C]);
+    const onlyA = minus(ca, cb), onlyB = minus(cb, ca), both = isectAll(ca, cb);
+    add("Protocol / ports compared", ppOf([C]), "", false);
+    if (minus([a.tested], [C]).length || minus([b.tested], [C]).length)
+      add("Not compared (tested by one only)", ppOf(minus([a.tested], [C])) || "nothing", ppOf(minus([b.tested], [C])) || "nothing", false);
+    add("Allowed for both", ppOf(both) || "nothing", "", false);
+    add("Allowed only for A", ppOf(onlyA) || "nothing", "", onlyA.length > 0);
+    add("Allowed only for B", ppOf(onlyB) || "nothing", "", onlyB.length > 0);
+    const pa = isectAll(a.partial, [C]), pb = isectAll(b.partial, [C]);
+    if (pa.length || pb.length)
+      add("Allowed for part of the tested addresses", ppOf(pa) || "nothing", ppOf(pb) || "nothing", ppOf(pa) !== ppOf(pb));
+  }
+  // rules matching the compared protocol / ports only
+  const within = (R, on) => C ? [...new Set(R.matched.filter(m => m.on === on && isect([...m.b, NOADDR], C)).map(m => m.t))] : [];
+  for (const [on, label] of [[true, "Granted by"], [false, "Switched-off rules that match"]]) {
+    const la = within(A, on), lb = within(B, on), sa = new Set(la), sb = new Set(lb);
+    const both = la.filter(x => sb.has(x)), oa = la.filter(x => !sb.has(x)), ob = lb.filter(x => !sa.has(x));
+    if (both.length) add(`${label}: both`, both, "", false);
+    if (oa.length || ob.length) add(`${label}: only A / only B`, oa, ob, true, true);
+  }
+  return {rows, diffs};
+}
+let cmpA = "", cmpB = "";
+const resKey = r => `${r.direction}|${r.test}`;
+function renderCompare(res) {
+  const valid = res.filter(r => r.verdict !== "INVALID");
+  const keys = valid.map(resKey);
+  if (!keys.includes(cmpA)) cmpA = keys[0] || "";
+  if (!keys.includes(cmpB)) cmpB = keys.find(k => k !== cmpA) || "";
+  const opts = valid.map(r => `<option value="${esc(resKey(r))}">${esc(r.test)} (${esc(r.direction)})</option>`).join("");
+  $("ca").innerHTML = opts; $("cb").innerHTML = opts;
+  $("ca").value = cmpA; $("cb").value = cmpB;
+  if (valid.length < 2) { $("cmp").innerHTML = `<tr><td class="muted">Add at least two valid tests to compare.</td></tr>`; return; }
+  const A = valid[keys.indexOf(cmpA)], B = valid[keys.indexOf(cmpB)], {rows, diffs} = compare(A, B);
+  const cellv = v => Array.isArray(v) ? (v.length ? v.map(esc).join("<br>") : "") : esc(v);
+  const verdict = v => BADGE[v] ? `<span class="badge ${BADGE[v]}">${v}</span>` : esc(v);
+  $("cmp").innerHTML = `<tr><th></th><th>A: ${esc(A.test)}</th><th>B: ${esc(B.test)}</th></tr>` +
+    `<tr><td colspan="3">${diffs ? `<span class="badge warn">${diffs} difference(s)</span>`
+      : `<span class="badge ok">same outcome</span> no differences other than the addresses`}</td></tr>` +
+    rows.map(r => `<tr><td class="nw"${r.diff ? ' style="font-weight:600"' : ""}>${esc(r.what)}${r.diff ? " &#9679;" : ""}</td>` +
+      (!r.pair ? `<td colspan="2">${cellv(r.va)}</td>`
+        : `<td>${r.what === "Verdict" ? verdict(r.va) : cellv(r.va)}</td><td>${r.what === "Verdict" ? verdict(r.vb) : cellv(r.vb)}</td>`) +
+      `</tr>`).join("");
+}
 
 // --- UI: tests, group / rule toggles, URL fragment state ---
 const BADGE = {ALLOWED: "ok", PARTIAL: "warn", DENIED: "error", INVALID: "info"};
@@ -548,6 +631,7 @@ const offGroups = () => boxes("input[data-g]").filter(c => !c.checked).map(c => 
 const offRules = () => boxes("input[data-r]").filter(c => !c.checked).map(rid);
 function setState(sc) {
   $("sname").value = sc.name || ""; $("snotes").value = sc.notes || ""; $("lines").value = sc.tests || "";
+  [cmpA, cmpB] = sc.compare || ["", ""];
   const g = new Set(sc.groups_off || []), r = new Set(sc.rules_off || []);
   boxes("input[data-g]").forEach(c => c.checked = !g.has(c.dataset.g));
   boxes("input[data-r]").forEach(c => c.checked = !r.has(rid(c)));
@@ -564,6 +648,8 @@ function save() {
   set("tests.roff", offRules().join(","));
   set("tests.name", $("sname").value);
   set("tests.notes", $("snotes").value);
+  set("tests.ca", cmpA);
+  set("tests.cb", cmpB);
   history.replaceState(null, "", "#" + p.toString());
 }
 // Results of a scenario evaluated on its own on/off state (independent of the checkboxes).
@@ -605,6 +691,8 @@ function run() {
       `<td><span class="badge ${BADGE[r.verdict]}">${r.verdict}</span>${one ? "" : ` <span class="muted">&times;${g.length}</span>`}</td>` +
       `<td>${ul(one ? r.ok : r.okN)}</td><td>${r.detail ? esc(r.detail) : ul(one ? r.rem : r.remN)}</td>` +
       `<td>${attributed(g, "by")}</td><td>${attributed(g, "off")}</td></tr>`; }).join("") : "";
+  renderCompare(res);
+  save();
 }
 // --- scenarios: export for others, import, evidence check ---
 const dataText = document.getElementById("extra-data").textContent;
@@ -618,7 +706,7 @@ const SCOPE = "Security groups only: network ACLs, route tables, firewalls and t
 async function current() {
   const st = {tests: $("lines").value, groups_off: offGroups(), rules_off: offRules()};
   return {format: "sg_rule_inventory.scenario/1", name: $("sname").value.trim(), notes: $("snotes").value.trim(),
-          ...st, exported: new Date().toISOString(),
+          ...st, compare: [cmpA, cmpB], exported: new Date().toISOString(),
           report: {account: T.report.account, generated: T.report.generated, groups: T.groups.map(g => g.id),
                    rule_data_sha256: await fingerprint},
           results: evaluate(st)};
@@ -695,6 +783,9 @@ $("port").addEventListener("keydown", e => { if (e.key === "Enter") $("add").cli
 $("clear").addEventListener("click", () => { $("lines").value = ""; run(); });
 $("allon").addEventListener("click", e => { e.preventDefault(); boxes("input[data-g], input[data-r]").forEach(c => c.checked = true); run(); });
 $("lines").addEventListener("input", run);
+$("ca").addEventListener("change", e => { cmpA = e.target.value; run(); });
+$("cb").addEventListener("change", e => { cmpB = e.target.value; run(); });
+$("swap").addEventListener("click", () => { [cmpA, cmpB] = [cmpB, cmpA]; run(); });
 sec.addEventListener("change", e => { if (e.target.dataset.g || e.target.dataset.r) run(); });
 $("sname").addEventListener("input", save);
 $("snotes").addEventListener("input", save);
@@ -702,6 +793,7 @@ $("snotes").addEventListener("input", save);
 const embedded = document.getElementById("scenario");
 const fromHash = ["tests", "tests.goff", "tests.roff", "tests.name", "tests.notes"].some(k => H.has(k));
 if (fromHash) setState({name: H.get("tests.name"), notes: H.get("tests.notes"), tests: H.get("tests"),
+  compare: [H.get("tests.ca") || "", H.get("tests.cb") || ""],
   groups_off: (H.get("tests.goff") || "").split(",").filter(Boolean), rules_off: (H.get("tests.roff") || "").split(",").filter(Boolean)});
 let shared = null;
 if (embedded) {
