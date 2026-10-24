@@ -23,6 +23,7 @@ have in common.
 |---|---|
 | [`nacl_shadow.py`](doc/nacl_shadow.md) | Which NACL rules can never take effect, or are partly overridden, because an earlier rule already matches their traffic? |
 | [`sg_rule_inventory.py`](doc/sg_rule_inventory.md) | What do these security groups (or the groups on interfaces, EC2 instances or Lambda functions, across accounts) allow, together? How do several interfaces differ? Would a given flow be allowed, and what if a rule or group were removed? (interactive tester in the HTML report) |
+| [`sg_migration_check.py`](doc/sg_migration_check.md) | Before removing an old security group for a new one: where is the old attached, is the new attached there too, and what access does each resource lose or gain? |
 | [`sg_access_gap.py`](doc/sg_access_gap.md) | What access does one security group grant that one or more others, combined, do not? |
 | [`sg_quota_audit.py`](doc/sg_quota_audit.md) | Which security groups and network interfaces are at or near their quotas, and which groups are stale, unattached, or default groups with rules? |
 | [`prefix_list_audit.py`](doc/prefix_list_audit.md) | Are managed prefix lists full, unused, oversized for the security group rule quota, or different between same-named copies? |
@@ -87,7 +88,7 @@ Tools that look inside member accounts scan the accounts you select:
   - `--profile`'s account by default;
   - `--account ID[,ID]` for specific accounts;
   - `--all-accounts` for every account with a local profile.
-- `sg_rule_inventory` and `sg_access_gap` read the accounts named in their ARNs, each through its local profile (`--profile` is used for its own account).
+- `sg_rule_inventory`, `sg_access_gap` and `sg_migration_check` read the accounts named in their ARNs, each through its local profile (`--profile` is used for its own account).
 
 Each account's profile comes from the local AWS config (`AWS_CONFIG_FILE` is honoured):
 - A profile's account is its `sso_account_id`, `aws_account_id`, or the account in its `role_arn`.
@@ -128,6 +129,7 @@ assets, light/dark aware), safe to attach or email. Most are interactive:
 
 The `sg_access_gap` report is a static page laid out per direction. The
 `sg_rule_inventory` report adds an access tester that runs in the browser.
+Long list cells can show one item per line (table option `lines`).
 
 ## Exit codes
 
@@ -149,6 +151,7 @@ fmm_rule_parity.py      FMS policy rule parity (A present, B missing)
 nacl_shadow.py          NACL rules hidden by earlier rules
 prefix_list_audit.py    managed prefix list capacity, usage and drift
 sg_access_gap.py        left SG access absent from right SG(s)
+sg_migration_check.py   old -> new security group migration: attachments and access change per resource
 sg_quota_audit.py       security group / interface quotas and clean-up candidates
 sg_rule_inventory.py    all rules of a set of groups / interfaces, combined access, access tester
 doc/                    one page per tool
