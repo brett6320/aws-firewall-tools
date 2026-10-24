@@ -167,37 +167,18 @@ def parse_target(spec: str, default_region: str | None, allow_workloads: bool = 
     raise ValueError(f"not a {kinds} ARN or id: {spec!r}")
 
 
-def parse_account_targets(specs: list[str], default_region: str | None) -> list[tuple[str | None, str, str]]:
-    """Targets of any kind, possibly in several accounts -> [(account or None for bare ids, region,
-    id)] in argument order, duplicates dropped."""
+def parse_account_targets(specs: list[str], default_region: str | None,
+                          allow_workloads: bool = True) -> list[tuple[str | None, str, str]]:
+    """Targets, possibly in several accounts -> [(account or None for bare ids, region, id)] in
+    argument order, duplicates dropped. Without allow_workloads only security groups."""
     seen, out = set(), []
-    for t in (parse_target(spec, default_region, allow_workloads=True) for spec in split_specs(specs)):
+    for t in (parse_target(spec, default_region, allow_workloads) for spec in split_specs(specs)):
         if t not in seen:
             seen.add(t)
             out.append(t)
     if not out:
         raise ValueError("no targets given")
     return out
-
-
-def parse_targets(specs: list[str], default_region: str | None, min_groups: int = 2,
-                  allow_workloads: bool = False) -> tuple[list[tuple[str, str]], str | None]:
-    """-> [(region, id)] in argument order (duplicates dropped) and the one account named by
-    ARNs (None if only ids); ARNs from several accounts are refused. See parse_target."""
-    targets, accounts = [], set()
-    for spec in split_specs(specs):
-        account, region, rid = parse_target(spec, default_region, allow_workloads)
-        if account:
-            accounts.add(account)
-        targets.append((region, rid))
-    if len(accounts) > 1:
-        raise ValueError(f"security groups must be in one account; ARNs name {', '.join(sorted(accounts))}")
-    seen = set()
-    targets = [t for t in targets if not (t in seen or seen.add(t))]
-    if len(targets) < min_groups:
-        raise ValueError("need at least two distinct security groups" if min_groups == 2
-                         else f"need at least {min_groups} security group(s)")
-    return targets, (accounts.pop() if accounts else None)
 
 
 def resolve_account_profiles(args, arn_accounts: set[str], bare_ids: bool) \
