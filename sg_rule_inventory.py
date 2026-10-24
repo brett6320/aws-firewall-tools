@@ -313,9 +313,10 @@ def cut(addrs: list[str]) -> str:
 
 
 def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_rules: bool = False) -> None:
-    """Text report: interfaces, one line per group, combined access, interface differences.
-    Individual rules (per group, and behind each interface difference) only with show_rules;
-    the saved HTML / CSV / JSON always hold them."""
+    """Text report. By default a summary only: account, interfaces, one line per group, and
+    counts of combined access entries and interface differences. Anything listing rules or
+    access (per-group rules, combined access, interface access differences and the rules behind
+    them) only with show_rules; the saved HTML / CSV / JSON always hold everything."""
     print(f"\nAccount {payload['account']} via {via_text(payload)}")
     print(f"Rule data SHA-256 {payload['rule_data_sha256']} (shown in the HTML report and in exported scenarios)")
     for w in payload["warnings"]:
@@ -342,8 +343,24 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_
             print(f"    {r.rule_id:<22} {r.rule}{desc}{also}")
         if not rs:
             print("  (no rules)")
+    d = payload["interface_deltas"]
+    count = lambda xs, direction: sum(x["direction"] == direction for x in xs)
     if not show_rules:
-        print(f"({len(rows)} rules not listed; --show-rules to list them, or see the HTML / CSV report)")
+        print(f"\nRules: {len(rows)}; combined access: {count(combined, 'ingress')} ingress / "
+              f"{count(combined, 'egress')} egress protocol/port entries")
+        if len(d["interfaces"]) >= 2:
+            if not d["groups"] and not d["access"]:
+                print(f"Interfaces: no differences; all {len(d['interfaces'])} allow exactly the same access")
+            else:
+                print(f"Interfaces: {len(d['groups'])} group attachment difference(s), {len(d['access'])} access "
+                      f"difference(s) ({count(d['access'], 'ingress')} ingress / {count(d['access'], 'egress')} egress)")
+                for e in d["interfaces"]:
+                    lacks = sum(e in a["missing_on"] for a in d["access"])
+                    if lacks:
+                        print(f"  {e}: lacks access in {lacks} difference(s)")
+        print("(--show-rules lists the rules, combined access and interface differences; the HTML / CSV / JSON "
+              "reports always include them)")
+        return
     print(f"\n=== combined access of {len(payload['groups'])} group(s)")
     for direction in ("ingress", "egress"):
         sel = [c for c in combined if c["direction"] == direction]
@@ -351,7 +368,6 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_
         prep = "to" if direction == "egress" else "from"
         for c in sel:
             print(f"    {c['access']} {prep} {cut(c['addresses'])}   [{', '.join(c['granted_by'])}]")
-    d = payload["interface_deltas"]
     if len(d["interfaces"]) < 2:
         return
     print(f"\n=== differences between {len(d['interfaces'])} interfaces")
@@ -362,7 +378,7 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_
     for a in d["access"]:
         print(f"  [{a['direction']}] {a['access']} {a['prep']} {cut(a['addresses'])}")
         print(f"      allowed on {', '.join(a['allowed_on'])}; not on {', '.join(a['missing_on'])}")
-        for r in a["rules"] if show_rules else []:
+        for r in a["rules"]:
             print(f"      rule: {r}")
 
 
@@ -1145,8 +1161,9 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
     p.add_argument("--region", default=os.getenv("AWS_REGION") or None,
                    help="Region for bare ids (default AWS_REGION, then the profile's region)")
     p.add_argument("--show-rules", action="store_true",
-                   help="List every rule in the text report (per group, and behind each interface difference); "
-                        "the HTML / CSV / JSON reports always include them")
+                   help="Text report: list every rule per group, the combined access, and each interface "
+                        "difference with its rules (default: summary and counts only). The HTML / CSV / JSON "
+                        "reports always include everything")
     add_profile_args(p)
     add_output_args(p)
     args = p.parse_args()
