@@ -35,9 +35,9 @@ What it does:
      it, and the switched-off rules that would. Without PORT, or for a
      partial result, the allowed and not-allowed ports / addresses are listed.
      Groups and individual rules can be switched off to see their effect.
-     Tests with identical outcomes share a row. Any two results can be
-     compared: verdict, ports allowed for both / only one, and the rules
-     involved, ignoring the addresses. A scenario (tests, switched-off
+     Tests with identical outcomes share a row. Results can be compared
+     with a baseline test, one column per compared test: verdict, ports
+     allowed for both / only one, and the rules involved, ignoring addresses. A scenario (tests, switched-off
      rules, name, notes) can be downloaded as a copy of the report that opens
      on it, or exported / imported as JSON, to show others that a path is open:
      on opening, the copy re-runs the tests, compares them with the exported
@@ -393,12 +393,15 @@ placeholder="change ticket, purpose, assumptions"></label>
 </div>
 <div class="cards" data-t="cards"></div>
 <div class="wrap"><table data-t="out"></table></div>
-<h3>Compare two tests</h3>
-<div class="muted">Differences between two results other than their addresses: verdict, the protocols / ports
-allowed (compared on the protocol / ports both tests cover), and the rules involved.</div>
-<div class="controls"><label>Test A<select data-t="ca" style="max-width:420px"></select></label>
-<label>Test B<select data-t="cb" style="max-width:420px"></select></label><button data-t="swap">Swap</button>
-<button data-t="cmphtml">Download comparison</button><button data-t="cmpcsv">Download comparison CSV</button></div>
+<h3>Compare tests with a baseline</h3>
+<div class="muted">Differences between a baseline test and each compared test, other than their addresses: verdict,
+the protocols / ports allowed (compared on the protocol / ports both cover), and the rules involved. Cells that
+differ from the baseline are highlighted.</div>
+<div class="controls"><label>Baseline<select data-t="cbase" style="max-width:420px"></select></label>
+<button data-t="cmphtml">Download comparison</button><button data-t="cmpcsv">Download comparison CSV</button>
+<div style="flex:1 1 100%"><span class="muted" style="font-size:11px">Compare with:</span>
+<button data-t="cwall">All</button> <button data-t="cwnone">None</button>
+<div data-t="cwith" style="display:flex;flex-wrap:wrap;gap:2px 14px;margin-top:4px"></div></div></div>
 <div class="wrap"><table data-t="cmp"></table></div>
 </section>
 """
@@ -636,60 +639,84 @@ function coverage(r) {
   const all = minus([tested], r.remB.map(([, b]) => [b[0], b[1], NOADDR]));
   return {tested, all, partial: minus(disjoint(r.okB.map(([, b]) => [b[0], b[1], NOADDR])), all)};
 }
-function compare(A, B) {
-  const a = coverage(A), b = coverage(B), C = isect(a.tested, b.tested), rows = [];
-  let diffs = 0;
-  // pair = show A and B side by side; otherwise one value spanning both columns
-  const add = (what, va, vb, diff, pair = vb !== "") => { rows.push({what, va, vb, diff, pair}); if (diff) diffs++; };
-  add("Direction", A.direction, B.direction, A.direction !== B.direction, true);
-  add("Verdict", A.verdict, B.verdict, A.verdict !== B.verdict, true);
-  if (!C) {
-    add("Protocol / ports compared", "none in common", "", false);
-  } else {
+// Test B against baseline A, on the protocol / ports both cover (C).
+function pairStats(A, B) {
+  const a = coverage(A), b = coverage(B), C = isect(a.tested, b.tested), st = {C};
+  if (C) {
     const ca = isectAll(a.all, [C]), cb = isectAll(b.all, [C]);
-    const onlyA = minus(ca, cb), onlyB = minus(cb, ca), both = isectAll(ca, cb);
-    add("Protocol / ports compared", ppOf([C]), "", false);
-    if (minus([a.tested], [C]).length || minus([b.tested], [C]).length)
-      add("Not compared (tested by one only)", ppOf(minus([a.tested], [C])) || "nothing", ppOf(minus([b.tested], [C])) || "nothing", false);
-    add("Allowed for both", ppOf(both) || "nothing", "", false);
-    // A's extra access under A, B's under B
-    add("Allowed only for this test", ppOf(onlyA) || "nothing", ppOf(onlyB) || "nothing",
-        onlyA.length > 0 || onlyB.length > 0, true);
-    const pa = isectAll(a.partial, [C]), pb = isectAll(b.partial, [C]);
-    if (pa.length || pb.length)
-      add("Allowed for part of the tested addresses", ppOf(pa) || "nothing", ppOf(pb) || "nothing", ppOf(pa) !== ppOf(pb));
+    Object.assign(st, {both: isectAll(ca, cb), missing: minus(ca, cb), extra: minus(cb, ca),
+      pa: isectAll(a.partial, [C]), pb: isectAll(b.partial, [C]), ncA: minus([a.tested], [C]), ncB: minus([b.tested], [C])});
   }
   // rules matching the compared protocol / ports only
   const within = (R, on) => C ? [...new Set(R.matched.filter(m => m.on === on && isect([...m.b, NOADDR], C)).map(m => m.t))] : [];
-  for (const [on, label] of [[true, "Granted by"], [false, "Switched-off rules that match"]]) {
-    const la = within(A, on), lb = within(B, on), sa = new Set(la), sb = new Set(lb);
-    const both = la.filter(x => sb.has(x)), oa = la.filter(x => !sb.has(x)), ob = lb.filter(x => !sa.has(x));
-    if (both.length) add(`${label}: both`, both, "", false);
-    if (oa.length || ob.length) add(`${label}: only A / only B`, oa, ob, true, true);
-  }
-  return {rows, diffs};
+  const split = on => { const la = within(A, on), lb = within(B, on), sa = new Set(la), sb = new Set(lb);
+    return {both: la.filter(x => sb.has(x)), base: la.filter(x => !sb.has(x)), here: lb.filter(x => !sa.has(x))}; };
+  st.by = split(true); st.off = split(false);
+  return st;
 }
-let cmpA = "", cmpB = "";
+// Comparison table model: a baseline column and one column per compared test. JSON-safe, so exported
+// comparisons can be checked by recomputing it.
+function comparisonTable(A, Bs) {
+  const S = Bs.map(B => pairStats(A, B)), rows = [], counts = Bs.map(() => 0);
+  const row = (what, base, cells, always = true) => {
+    const has = v => Array.isArray(v) ? v.length > 0 : !!v;
+    if (!always && !has(base) && !cells.some(c => has(c.v))) return;
+    cells.forEach((c, i) => { if (c.diff) counts[i]++; });
+    rows.push({what, base, cells: cells.map(c => c.v), diff: cells.map(c => !!c.diff)});
+  };
+  const pp = xs => ppOf(xs || []) || "nothing", na = "none in common";
+  row("Direction", A.direction, Bs.map(B => ({v: B.direction, diff: B.direction !== A.direction})));
+  row("Verdict", A.verdict, Bs.map(B => ({v: B.verdict, diff: B.verdict !== A.verdict})));
+  row("Protocol / ports compared", ppOf([coverage(A).tested]), S.map(s => ({v: s.C ? ppOf([s.C]) : na})));
+  row("Not compared (tested by one only)", "", S.map(s => ({v: !s.C ? "" : [s.ncA.length ? `baseline only: ${pp(s.ncA)}` : "",
+    s.ncB.length ? `this test only: ${pp(s.ncB)}` : ""].filter(Boolean).join("; ")})), false);
+  row("Allowed for both", "", S.map(s => ({v: s.C ? pp(s.both) : na})));
+  row("Allowed for baseline, not here", "", S.map(s => ({v: s.C ? pp(s.missing) : na, diff: s.C && s.missing.length > 0})));
+  row("Allowed here, not for baseline", "", S.map(s => ({v: s.C ? pp(s.extra) : na, diff: s.C && s.extra.length > 0})));
+  row("Allowed for part of the tested addresses", "", S.map(s => ({v: !s.C || (!s.pa.length && !s.pb.length) ? ""
+    : `baseline: ${pp(s.pa)}; this test: ${pp(s.pb)}`, diff: s.C && ppOf(s.pa) !== ppOf(s.pb)})), false);
+  row("Granted by", A.by, S.map(s => ({v: s.by.both})), false);
+  row("Granted only for baseline", "", S.map(s => ({v: s.by.base, diff: s.by.base.length > 0})), false);
+  row("Granted only here", "", S.map(s => ({v: s.by.here, diff: s.by.here.length > 0})), false);
+  row("Switched-off rules matching both", A.off, S.map(s => ({v: s.off.both})), false);
+  row("Switched-off rules matching only baseline", "", S.map(s => ({v: s.off.base, diff: s.off.base.length > 0})), false);
+  row("Switched-off rules matching only here", "", S.map(s => ({v: s.off.here, diff: s.off.here.length > 0})), false);
+  return {baseline: {test: A.test, direction: A.direction},
+          against: Bs.map((B, i) => ({test: B.test, direction: B.direction, differences: counts[i]})), rows};
+}
+// The table as HTML (used in the report and in the exported comparison page).
+function comparisonTableHtml(m) {
+  const cell = v => Array.isArray(v) ? v.map(esc).join("<br>") : esc(v);
+  const show = (what, v) => what === "Verdict" && BADGE[v] ? `<span class="badge ${BADGE[v]}">${v}</span>` : cell(v);
+  const hl = ' style="background:var(--warn-bg)"';
+  return `<tr><th></th><th>Baseline: ${esc(m.baseline.test)}</th>` +
+    m.against.map(b => `<th>${esc(b.test)}</th>`).join("") + `</tr>` +
+    `<tr><td></td><td></td>` + m.against.map(b => `<td>${b.differences
+      ? `<span class="badge warn">${b.differences} difference(s)</span>` : `<span class="badge ok">same outcome</span>`}</td>`).join("") +
+    `</tr>` + m.rows.map(r => `<tr><td class="nw"${r.diff.some(Boolean) ? ' style="font-weight:600"' : ""}>${esc(r.what)}` +
+      `${r.diff.some(Boolean) ? " &#9679;" : ""}</td><td>${show(r.what, r.base)}</td>` +
+      r.cells.map((c, i) => `<td${r.diff[i] ? hl : ""}>${show(r.what, c)}</td>`).join("") + `</tr>`).join("");
+}
+let cmpBase = "", cmpWith = null;           // cmpWith null = every other test
 const resKey = r => `${r.direction}|${r.test}`;
+function pickComparison(valid, base, withKeys) {
+  const A = valid.find(r => resKey(r) === base);
+  if (!A) return null;
+  const Bs = (withKeys === null || withKeys === undefined ? valid.map(resKey).filter(k => k !== base) : withKeys)
+    .map(k => valid.find(r => resKey(r) === k)).filter(B => B && B !== A);
+  return Bs.length ? comparisonTable(A, Bs) : null;
+}
 function renderCompare(res) {
-  const valid = res.filter(r => r.verdict !== "INVALID");
-  const keys = valid.map(resKey);
-  if (!keys.includes(cmpA)) cmpA = keys[0] || "";
-  if (!keys.includes(cmpB)) cmpB = keys.find(k => k !== cmpA) || "";
-  const opts = valid.map(r => `<option value="${esc(resKey(r))}">${esc(r.test)} (${esc(r.direction)})</option>`).join("");
-  $("ca").innerHTML = opts; $("cb").innerHTML = opts;
-  $("ca").value = cmpA; $("cb").value = cmpB;
-  if (valid.length < 2) { $("cmp").innerHTML = `<tr><td class="muted">Add at least two valid tests to compare.</td></tr>`; return; }
-  const A = valid[keys.indexOf(cmpA)], B = valid[keys.indexOf(cmpB)], {rows, diffs} = compare(A, B);
-  const cellv = v => Array.isArray(v) ? (v.length ? v.map(esc).join("<br>") : "") : esc(v);
-  const verdict = v => BADGE[v] ? `<span class="badge ${BADGE[v]}">${v}</span>` : esc(v);
-  $("cmp").innerHTML = `<tr><th></th><th>A: ${esc(A.test)}</th><th>B: ${esc(B.test)}</th></tr>` +
-    `<tr><td colspan="3">${diffs ? `<span class="badge warn">${diffs} difference(s)</span>`
-      : `<span class="badge ok">same outcome</span> no differences other than the addresses`}</td></tr>` +
-    rows.map(r => `<tr><td class="nw"${r.diff ? ' style="font-weight:600"' : ""}>${esc(r.what)}${r.diff ? " &#9679;" : ""}</td>` +
-      (!r.pair ? `<td colspan="2">${cellv(r.va)}</td>`
-        : `<td>${r.what === "Verdict" ? verdict(r.va) : cellv(r.va)}</td><td>${r.what === "Verdict" ? verdict(r.vb) : cellv(r.vb)}</td>`) +
-      `</tr>`).join("");
+  const valid = res.filter(r => r.verdict !== "INVALID"), keys = valid.map(resKey);
+  if (!keys.includes(cmpBase)) cmpBase = keys[0] || "";
+  $("cbase").innerHTML = valid.map(r => `<option value="${esc(resKey(r))}">${esc(r.test)} (${esc(r.direction)})</option>`).join("");
+  $("cbase").value = cmpBase;
+  const sel = new Set(cmpWith === null ? keys : cmpWith);
+  $("cwith").innerHTML = valid.filter(r => resKey(r) !== cmpBase).map(r => `<label class="check"><input type="checkbox"
+    data-cw="${esc(resKey(r))}"${sel.has(resKey(r)) ? " checked" : ""}> ${esc(r.test)} (${esc(r.direction)})</label>`).join("");
+  const m = valid.length < 2 ? null : pickComparison(valid, cmpBase, cmpWith);
+  $("cmp").innerHTML = m ? comparisonTableHtml(m) : `<tr><td class="muted">${valid.length < 2
+    ? "Add at least two valid tests to compare." : "Tick at least one test to compare with the baseline."}</td></tr>`;
 }
 
 // --- UI: tests, group / rule toggles, URL fragment state ---
@@ -712,7 +739,9 @@ const offGroups = () => boxes("input[data-g]").filter(c => !c.checked).map(c => 
 const offRules = () => boxes("input[data-r]").filter(c => !c.checked).map(rid);
 function setState(sc) {
   $("sname").value = sc.name || ""; $("snotes").value = sc.notes || ""; $("lines").value = sc.tests || "";
-  [cmpA, cmpB] = sc.compare || ["", ""];
+  // compare: {base, with} (with null = every other test); older scenarios: [A, B]
+  const c = sc.compare || {};
+  [cmpBase, cmpWith] = Array.isArray(c) ? [c[0] || "", c[1] ? [c[1]] : null] : [c.base || "", c.with ?? null];
   const g = new Set(sc.groups_off || []), r = new Set(sc.rules_off || []);
   boxes("input[data-g]").forEach(c => c.checked = !g.has(c.dataset.g));
   boxes("input[data-r]").forEach(c => c.checked = !r.has(rid(c)));
@@ -729,8 +758,8 @@ function save() {
   set("tests.roff", offRules().join(","));
   set("tests.name", $("sname").value);
   set("tests.notes", $("snotes").value);
-  set("tests.ca", cmpA);
-  set("tests.cb", cmpB);
+  set("tests.cbase", cmpBase);
+  set("tests.cwith", cmpWith === null ? "" : JSON.stringify(cmpWith));
   history.replaceState(null, "", "#" + p.toString());
 }
 // Results of a scenario evaluated on its own on/off state (independent of the checkboxes).
@@ -745,12 +774,9 @@ function evaluate(sc) {
 }
 // The comparison of a scenario's selected pair (sc.compare = [key A, key B]), or null.
 function comparisonOf(sc) {
-  const [ka, kb] = sc.compare || [], valid = rawResults(sc).filter(r => r.verdict !== "INVALID");
-  const A = valid.find(r => resKey(r) === ka), B = valid.find(r => resKey(r) === kb);
-  if (!A || !B) return null;
-  const {rows, diffs} = compare(A, B);
-  return {a: {test: A.test, direction: A.direction}, b: {test: B.test, direction: B.direction}, differences: diffs,
-          rows: rows.map(({what, va, vb, diff, pair}) => ({what, a: va, b: vb, different: diff, pair}))};
+  const c = sc.compare || {}, valid = rawResults(sc).filter(r => r.verdict !== "INVALID");
+  const [base, withKeys] = Array.isArray(c) ? [c[0], c[1] ? [c[1]] : null] : [c.base, c.with ?? null];
+  return pickComparison(valid, base, withKeys);
 }
 function run() {
   save();
@@ -798,10 +824,10 @@ const SCOPE = "Security groups only: network ACLs, route tables, firewalls and t
 async function current() {
   const st = {tests: $("lines").value, groups_off: offGroups(), rules_off: offRules()};
   return {format: "sg_rule_inventory.scenario/1", name: $("sname").value.trim(), notes: $("snotes").value.trim(),
-          ...st, compare: [cmpA, cmpB], exported: new Date().toISOString(),
+          ...st, compare: {base: cmpBase, with: cmpWith}, exported: new Date().toISOString(),
           report: {account: T.report.account, generated: T.report.generated, groups: T.groups.map(g => g.id),
                    rule_data_sha256: await fingerprint},
-          results: evaluate(st), comparison: comparisonOf({...st, compare: [cmpA, cmpB]})};
+          results: evaluate(st), comparison: comparisonOf({...st, compare: {base: cmpBase, with: cmpWith}})};
 }
 // A copy of this page that opens on scenario `sc` (focus "compare" scrolls to the comparison).
 function exportHtml(sc, file) {
@@ -837,9 +863,10 @@ async function evidence(sc, how) {
     sc.comparison ? (JSON.stringify(comparisonOf(sc)) === JSON.stringify(sc.comparison)
       ? B("ok", "comparison reproduced") : B("error", "comparison differs from the exported comparison")) : "",
   ].filter(Boolean).join(" ");
-  const cmpText = sc.comparison ? `Comparison: A = ${sc.comparison.a.test} (${sc.comparison.a.direction}), B = ` +
-    `${sc.comparison.b.test} (${sc.comparison.b.direction}): ` + (sc.comparison.differences
-      ? `${sc.comparison.differences} difference(s) when exported` : "same outcome when exported, no differences other than the addresses") : "";
+  const cm = sc.comparison, nd = cm ? cm.against.filter(b => b.differences).length : 0;
+  const cmpText = cm ? `Comparison: baseline ${cm.baseline.test} (${cm.baseline.direction}) against ` +
+    `${cm.against.length} test(s); when exported ${nd} differed from the baseline and ` +
+    `${cm.against.length - nd} had the same outcome.` : "";
   const offG = sc.groups_off || [], offR = sc.rules_off || [];
   const offText = !offG.length && !offR.length ? "nothing: every rule of every group is on"
     : [...offG.map(g => `group ${g}`), ...offR.map(r => { const x = rules.find(y => y.id === r);
@@ -862,26 +889,24 @@ $("exphtml").addEventListener("click", async () => {
   exportHtml(sc, `sg_scenario_${slug(sc.name)}.html`);
 });
 // The comparison alone: a small static page (no rule data) carrying a compact scenario of just the
-// two tests, which "Import scenario" in the full report re-runs to check it.
+// compared tests, which "Import scenario" in the full report re-runs to check it.
 async function comparisonScenario() {
   const full = await current();
   if (!full.comparison) return null;
-  const c = full.comparison, tests = [...new Set([c.a.test, c.b.test])].join("\n");
-  const st = {tests, groups_off: full.groups_off, rules_off: full.rules_off, compare: [cmpA, cmpB]};
-  return {...full, ...st, name: full.name || `${c.a.test} vs ${c.b.test}`, focus: "compare",
-          results: evaluate(st), comparison: comparisonOf(st)};
+  const c = full.comparison, key = x => `${x.direction}|${x.test}`;
+  const tests = [...new Set([c.baseline, ...c.against].map(x => x.test))].join("\n");
+  const st = {tests, groups_off: full.groups_off, rules_off: full.rules_off,
+              compare: {base: key(c.baseline), with: c.against.map(key)}};
+  return {...full, ...st, focus: "compare", results: evaluate(st), comparison: comparisonOf(st),
+          name: full.name || (c.against.length === 1 ? `${c.baseline.test} vs ${c.against[0].test}`
+                                                     : `${c.baseline.test} vs ${c.against.length} tests`)};
 }
 function comparisonPage(sc) {
-  const c = sc.comparison, r = sc.report || {};
-  const cell = v => Array.isArray(v) ? v.map(esc).join("<br>") : esc(v);
-  const vb = v => BADGE[v] ? `<span class="badge ${BADGE[v]}">${v}</span>` : cell(v);
+  const c = sc.comparison, r = sc.report || {}, nd = c.against.filter(b => b.differences).length;
   const offG = sc.groups_off || [], offR = sc.rules_off || [];
   const off = !offG.length && !offR.length ? "nothing: every rule of every group was on"
     : [...offG.map(g => `group ${g}`), ...offR.map(id => { const x = rules.find(y => y.id === id);
         return x ? `${x.g} ${x.id} ${x.text}` : id; })].join("; ");
-  const rows = c.rows.map(x => `<tr><td class="w${x.different ? " d" : ""}">${esc(x.what)}${x.different ? " &#9679;" : ""}</td>` +
-    (x.pair ? `<td>${x.what === "Verdict" ? vb(x.a) : cell(x.a)}</td><td>${x.what === "Verdict" ? vb(x.b) : cell(x.b)}</td>`
-            : `<td colspan="2">${cell(x.a)}</td>`) + `</tr>`).join("");
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc("Comparison: " + sc.name)}</title><style>
 :root{--bg:#fff;--fg:#1d2329;--muted:#5b6670;--line:#d9dee3;--card:#f6f8fa;--error:#b42318;--error-bg:#fde8e7;
@@ -893,7 +918,7 @@ margin:0 auto;padding:24px 16px;max-width:1200px}h1{font-size:22px;margin:0 0 6p
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:12px 0}
 table{border-collapse:collapse;width:100%;margin:8px 0}th,td{text-align:left;vertical-align:top;padding:6px 8px;
 border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px}td{font:12.5px ui-monospace,Menlo,Consolas,monospace}
-td.w{white-space:nowrap}td.d{font-weight:600}.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+td.nw{white-space:nowrap}.wrap{overflow-x:auto}.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
 font-weight:600;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
 .error{color:var(--error);background:var(--error-bg)}.warn{color:var(--warn);background:var(--warn-bg)}
 .info{color:var(--info);background:var(--info-bg)}.ok{color:var(--ok);background:var(--ok-bg)}
@@ -902,15 +927,15 @@ font-weight:600;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,s
 ${sc.notes ? `<div>${esc(sc.notes)}</div>` : ""}
 <div class="muted">Exported ${esc(sc.exported)} from the sg_rule_inventory report for account ${esc(r.account || "?")}
 generated ${esc(r.generated || "?")}. Source rule data SHA-256 ${esc(r.rule_data_sha256 || "n/a")}.</div>
-<div class="card"><div><b>A:</b> ${esc(c.a.test)} (${esc(c.a.direction)}) &nbsp; <b>B:</b> ${esc(c.b.test)} (${esc(c.b.direction)})</div>
-<div style="margin-top:6px">${c.differences ? `<span class="badge warn">${c.differences} difference(s)</span>`
-  : `<span class="badge ok">same outcome</span> no differences other than the addresses`}</div>
+<div class="card"><div><b>Baseline:</b> ${esc(c.baseline.test)} (${esc(c.baseline.direction)}) &nbsp;
+<b>Compared:</b> ${c.against.length} test(s): ${nd ? `<span class="badge warn">${nd} differ</span>` : ""}
+${c.against.length - nd ? `<span class="badge ok">${c.against.length - nd} same outcome</span>` : ""}</div>
 <div style="margin-top:6px"><b>Switched off:</b> ${esc(off)}</div></div>
-<table><tr><th></th><th>A: ${esc(c.a.test)}</th><th>B: ${esc(c.b.test)}</th></tr>${rows}</table>
+<div class="wrap"><table>${comparisonTableHtml(c)}</table></div>
 <div class="muted">Addresses are ignored: the comparison covers verdict, the protocol / ports allowed (on the protocol /
 ports both tests cover) and the rules involved. ${esc(SCOPE)}</div>
 <div class="muted" style="margin-top:6px">To verify: open the full report with the same rule data SHA-256 and load this file
-with "Import scenario"; it re-runs both tests and checks the comparison is reproduced.</div>
+with "Import scenario"; it re-runs the tests and checks the comparison is reproduced.</div>
 <script id="scenario" type="application/json">${JSON.stringify(sc).replace(/<\//g, "<\\/")}</script>
 </body></html>`;
 }
@@ -922,9 +947,13 @@ $("cmpcsv").addEventListener("click", async () => {
   const c = (await current()).comparison;
   if (!c) return;
   const q = v => { v = Array.isArray(v) ? v.join("; ") : String(v ?? ""); return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; };
-  const lines = [["what", `A: ${c.a.test} (${c.a.direction})`, `B: ${c.b.test} (${c.b.direction})`, "different"].map(q).join(",")]
-    .concat(c.rows.map(r => [r.what, r.a, r.pair ? r.b : "(same for both)", r.different ? "yes" : ""].map(q).join(",")));
-  download(`sg_comparison_${slug(c.a.test + "_vs_" + c.b.test)}.csv`, lines.join("\n"), "text/csv");
+  // one column per test; a cell that differs from the baseline is prefixed "[differs] "
+  const lines = [["what", `baseline: ${c.baseline.test} (${c.baseline.direction})`,
+                  ...c.against.map(b => `${b.test} (${b.direction})`)].map(q).join(",")]
+    .concat([["differences", "", ...c.against.map(b => String(b.differences))].map(q).join(",")])
+    .concat(c.rows.map(r => [r.what, r.base, ...r.cells.map((v, i) =>
+      (r.diff[i] ? "[differs] " : "") + (Array.isArray(v) ? v.join("; ") : v))].map(q).join(",")));
+  download(`sg_comparison_${slug(c.baseline.test)}.csv`, lines.join("\n"), "text/csv");
 });
 $("expjson").addEventListener("click", async () =>
   download(`sg_scenario_${slug($("sname").value)}.json`, JSON.stringify(await current(), null, 2), "application/json"));
@@ -954,9 +983,12 @@ $("port").addEventListener("keydown", e => { if (e.key === "Enter") $("add").cli
 $("clear").addEventListener("click", () => { $("lines").value = ""; run(); });
 $("allon").addEventListener("click", e => { e.preventDefault(); boxes("input[data-g], input[data-r]").forEach(c => c.checked = true); run(); });
 $("lines").addEventListener("input", run);
-$("ca").addEventListener("change", e => { cmpA = e.target.value; run(); });
-$("cb").addEventListener("change", e => { cmpB = e.target.value; run(); });
-$("swap").addEventListener("click", () => { [cmpA, cmpB] = [cmpB, cmpA]; run(); });
+$("cbase").addEventListener("change", e => { cmpBase = e.target.value; run(); });
+$("cwith").addEventListener("change", () => {
+  const all = boxes("input[data-cw]"), on = all.filter(c => c.checked).map(c => c.dataset.cw);
+  cmpWith = on.length === all.length ? null : on; run(); });
+$("cwall").addEventListener("click", () => { cmpWith = null; run(); });
+$("cwnone").addEventListener("click", () => { cmpWith = []; run(); });
 sec.addEventListener("change", e => { if (e.target.dataset.g || e.target.dataset.r) run(); });
 $("sname").addEventListener("input", save);
 $("snotes").addEventListener("input", save);
@@ -964,7 +996,8 @@ $("snotes").addEventListener("input", save);
 const embedded = document.getElementById("scenario");
 const fromHash = ["tests", "tests.goff", "tests.roff", "tests.name", "tests.notes"].some(k => H.has(k));
 if (fromHash) setState({name: H.get("tests.name"), notes: H.get("tests.notes"), tests: H.get("tests"),
-  compare: [H.get("tests.ca") || "", H.get("tests.cb") || ""],
+  compare: H.has("tests.cbase") ? {base: H.get("tests.cbase"), with: H.get("tests.cwith") ? JSON.parse(H.get("tests.cwith")) : null}
+    : [H.get("tests.ca") || "", H.get("tests.cb") || ""],
   groups_off: (H.get("tests.goff") || "").split(",").filter(Boolean), rules_off: (H.get("tests.roff") || "").split(",").filter(Boolean)});
 let shared = null;
 if (embedded) {
