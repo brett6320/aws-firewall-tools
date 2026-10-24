@@ -53,6 +53,8 @@ is read. The run stops (exit 2) if:
 |---|---|
 | Access tester | See [below](#access-tester) |
 | Interfaces | Each interface given: what it is attached to, its VPC, and its groups |
+| Group attachment differences | With two or more interfaces: groups attached to some of them but not all |
+| Interface differences | With two or more interfaces: access allowed on some of them but not others. See [below](#comparing-interfaces) |
 | Groups | Name, VPC, region, the interface it came from, ingress/egress rule counts, description |
 | Rules | Every rule of every group, one row per rule. Filter and sort by group, group name, direction, protocol, ports, peer, peer type and *also granted*; unique counts and a per-group summary |
 | Combined access | The union of all rules per direction: one row per protocol/port, with the merged CIDRs (or group / prefix-list references) and the groups and rules that grant them |
@@ -66,6 +68,32 @@ grant too:
 
 Prefix lists are expanded to their current entries. Self-references show as
 `self`.
+
+## Comparing interfaces
+
+Give two or more interfaces, for example the members of an Auto Scaling group
+or the primary and standby of a pair, and the report lists only what differs
+between them.
+
+- Each interface's access is the union of all its groups' rules, per direction.
+- The interfaces' access is split into exact pieces (protocol / ports × addresses), each tagged with the interfaces that allow it.
+- Pieces allowed on every interface are left out. Each remaining row gives:
+  - direction, protocol / ports and the CIDRs (or group / prefix-list references);
+  - **Allowed on** and **Not allowed on**;
+  - **Rules**: the rules on the allowing interfaces that grant it.
+
+Because access is compared exactly, interfaces with different groups but the
+same effective access show no access difference. For example, one group
+allowing `10.1.0.0/16` and another allowing two `/17`s are equivalent. Such
+interfaces appear only under group attachment differences.
+
+The table filters by direction, protocol / ports, allowed on and not allowed
+on. A summary counts the differences per interface that lacks the access.
+The text report ends with the same list, or "none: every interface allows
+exactly the same access".
+
+Groups given directly, not through an interface, are not part of this
+comparison.
 
 ## Access tester
 
@@ -120,10 +148,14 @@ covers (`×3`).
 **Comparing two tests.** Under the results, pick test A and test B. For a `both` test, each direction is its own choice. The comparison ignores the addresses and shows:
 - direction and verdict of each;
 - the protocol / ports both tests cover, which is what is compared. Anything only one test covers is listed as not compared;
-- the protocols / ports allowed for both, only for A, and only for B. "Allowed" means for every tested address; ports allowed for only part of a CIDR are listed separately;
+- the protocols / ports allowed for both, and in one row, those allowed only for A (under A) and only for B (under B). "Allowed" means for every tested address; ports allowed for only part of a CIDR are listed separately;
 - the granting rules, and switched-off rules that would match, for both, only A, and only B, within the compared protocol / ports.
 
 Rows that differ are marked, with a count at the top; "same outcome" means nothing differs except the addresses. The selected pair is kept in the URL fragment and in exported scenarios.
+
+To share a comparison:
+- **Download comparison report**: a copy of the report that opens on the comparison. It works like a scenario report (see [below](#sharing-a-scenario-as-evidence)): the evidence panel shows the comparison as exported, checks that it is reproduced, and checks the rule data. If no scenario name was given, the name is "A vs B".
+- **Download comparison CSV**: one line per row (what, A, B, different).
 
 **Switching groups and rules off.** Every group and rule has a checkbox in the "Groups and rules used by the tester" panel. The panel is collapsed by default; its heading shows how many rules are on.
 Untick one to see what the set would allow without it. "All on" restores
@@ -148,6 +180,7 @@ the top of the tester shows:
 - the name, notes, export time, and the source report's account and generation time;
 - whether the **rule data** matches the scenario. The SHA-256 of the embedded rule data is recomputed and compared with the value stored at export;
 - whether the **results are reproduced**. The tests are run again on the scenario's on/off state and compared with the exported results;
+- if the scenario includes a comparison, the comparison as exported and whether it is **reproduced**;
 - **switched-off** groups and rules, listed explicitly ("nothing" when every rule was on). Switched-off ids that are not in the report are flagged;
 - the scope: security groups only. Network ACLs, route tables, firewalls and the far end's security groups are not evaluated.
 
@@ -177,16 +210,18 @@ Plus the common output flags, described under [Reports](../README.md#reports).
   - which account and profile were used, and the rule data SHA-256;
   - interfaces and their groups;
   - each group's rules by direction, with descriptions and *also granted*;
-  - the combined access per direction. Long CIDR lists are cut at 8; the files hold everything.
+  - the combined access per direction;
+  - with two or more interfaces, the differences between them.
+  - Long CIDR lists are cut at 8; the files hold everything.
 - **CSV**: one row per rule. List cells are `; `-separated.
-- **JSON**: `{account, profile, profile_source, generated, interfaces, warnings, groups, rules, combined_access, rule_data_sha256}`.
+- **JSON**: `{account, profile, profile_source, generated, interfaces, warnings, groups, rules, combined_access, interface_deltas, rule_data_sha256}`. `interface_deltas` holds `{interfaces, groups, access}`.
 - **HTML**: the sections above.
 
 Reports are saved under `reports/sg_rule_inventory/YYYY-MM-DD/`.
 
 Exit codes:
 - `0`: done.
-- `1`: a referenced prefix list could not be read. Rules using it are matched by id only.
+- `1`: the interfaces given differ (groups or access), or a referenced prefix list could not be read. Rules using an unreadable prefix list are matched by id only.
 - `2`: fatal (bad arguments, no usable profile, wrong account, AWS error).
 
 ## IAM permissions
