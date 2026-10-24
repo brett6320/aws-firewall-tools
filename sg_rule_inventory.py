@@ -312,8 +312,10 @@ def cut(addrs: list[str]) -> str:
     return ", ".join(addrs[:MAX_CIDRS_SHOWN]) + more
 
 
-def print_report(payload: dict, rows: list[RuleRow], combined: list[dict]) -> None:
-    """Text report: interfaces, rules per group, combined access, interface differences."""
+def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_rules: bool = False) -> None:
+    """Text report: interfaces, one line per group, combined access, interface differences.
+    Individual rules (per group, and behind each interface difference) only with show_rules;
+    the saved HTML / CSV / JSON always hold them."""
     print(f"\nAccount {payload['account']} via {via_text(payload)}")
     print(f"Rule data SHA-256 {payload['rule_data_sha256']} (shown in the HTML report and in exported scenarios)")
     for w in payload["warnings"]:
@@ -323,9 +325,13 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict]) -> No
               f"-> {', '.join(n['groups']) or '(no groups)'}")
     for g in payload["groups"]:
         rs = [r for r in rows if r.group_id == g["group_id"]]
-        print(f"\n=== {g['group_id']} ({g['name']}, {g['vpc_id']}, {g['region']})  "
-              f"{sum(r.direction == 'ingress' for r in rs)} in / {sum(r.direction == 'egress' for r in rs)} out"
-              + (f"  via {', '.join(g['via'])}" if g["via"] else ""))
+        line = (f"{g['group_id']} ({g['name']}, {g['vpc_id']}, {g['region']})  "
+                f"{sum(r.direction == 'ingress' for r in rs)} in / {sum(r.direction == 'egress' for r in rs)} out"
+                + (f"  via {', '.join(g['via'])}" if g["via"] else ""))
+        if not show_rules:
+            print(f"group {line}")
+            continue
+        print(f"\n=== {line}")
         cur = None
         for r in rs:
             if r.direction != cur:
@@ -336,6 +342,8 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict]) -> No
             print(f"    {r.rule_id:<22} {r.rule}{desc}{also}")
         if not rs:
             print("  (no rules)")
+    if not show_rules:
+        print(f"({len(rows)} rules not listed; --show-rules to list them, or see the HTML / CSV report)")
     print(f"\n=== combined access of {len(payload['groups'])} group(s)")
     for direction in ("ingress", "egress"):
         sel = [c for c in combined if c["direction"] == direction]
@@ -354,7 +362,7 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict]) -> No
     for a in d["access"]:
         print(f"  [{a['direction']}] {a['access']} {a['prep']} {cut(a['addresses'])}")
         print(f"      allowed on {', '.join(a['allowed_on'])}; not on {', '.join(a['missing_on'])}")
-        for r in a["rules"]:
+        for r in a["rules"] if show_rules else []:
             print(f"      rule: {r}")
 
 
@@ -1136,6 +1144,9 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
                         "(never -priv/-cpar), else AWS_PROFILE")
     p.add_argument("--region", default=os.getenv("AWS_REGION") or None,
                    help="Region for bare ids (default AWS_REGION, then the profile's region)")
+    p.add_argument("--show-rules", action="store_true",
+                   help="List every rule in the text report (per group, and behind each interface difference); "
+                        "the HTML / CSV / JSON reports always include them")
     add_profile_args(p)
     add_output_args(p)
     args = p.parse_args()
@@ -1200,7 +1211,7 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
     else:
-        print_report(payload, rows, combined)
+        print_report(payload, rows, combined, args.show_rules)
         print_saved(paths)
     deltas = payload["interface_deltas"]
     return 1 if warnings or deltas["groups"] or deltas["access"] else 0
