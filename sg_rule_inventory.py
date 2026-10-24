@@ -26,9 +26,16 @@ What it does:
          protocol/port, and which groups grant each piece
   4. The HTML report embeds the rule data and an access tester (JavaScript,
      runs in the browser, no AWS access): enter DIRECTION ADDRESS PROTOCOL
-     [PORT] tests and see ALLOWED / PARTIAL (with the part not granted) /
-     DENIED, the rules that grant it, and the switched-off rules that would.
+     [PORT] tests and see ALLOWED / PARTIAL / DENIED, the rules that grant
+     it, and the switched-off rules that would. Without PORT, or for a
+     partial result, the allowed and not-allowed ports / addresses are listed.
      Groups and individual rules can be switched off to see their effect.
+     Tests with identical results share a row. A scenario (tests, switched-off
+     rules, name, notes) can be downloaded as a copy of the report that opens
+     on it, or exported / imported as JSON, to show others that a path is open:
+     on opening, the copy re-runs the tests, compares them with the exported
+     results, checks the rule data against its SHA-256 (also printed by the
+     run that made the report), and lists anything that was switched off.
 
 Tester syntax (one test per line):
 
@@ -41,7 +48,8 @@ Tester syntax (one test per line):
     in any all                      all traffic from anywhere (IPv4 and IPv6)
 
 Ingress ADDRESS is the traffic's source, egress ADDRESS its destination; PORT
-is the destination port. A missing PORT means every port. Group references
+is the destination port. A missing PORT tests every port and lists which
+ports / ranges are allowed and which are not. Group references
 are matched by group id only (the report cannot know the members' addresses).
 
 Profile: --profile if given. Otherwise the account in the ARNs selects the
@@ -76,6 +84,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
@@ -238,6 +247,7 @@ def cut(addrs: list[str]) -> str:
 def print_report(payload: dict, rows: list[RuleRow], combined: list[dict]) -> None:
     """Text report: interfaces, rules per group, combined access."""
     print(f"\nAccount {payload['account']} via {via_text(payload)}")
+    print(f"Rule data SHA-256 {payload['rule_data_sha256']} (shown in the HTML report and in exported scenarios)")
     for w in payload["warnings"]:
         print(f"[WARN ] PREFIX_LIST_UNRESOLVED {w}; matched by id only")
     for n in payload["interfaces"]:
@@ -269,9 +279,10 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict]) -> No
 
 TESTER_HTML = """
 <section id="tester"><h2>Access tester</h2>
+<div data-t="evidence"></div>
 <div class="muted">Checks flows against the combined rules switched on below, using the rule data in this file
 (prefix lists as of the report time). Runs in the browser only; nothing is sent anywhere. Ingress address = source, egress address = destination, port = destination
-port; ICMP port = TYPE[/CODE]; no port = every port. One test per line:
+port; ICMP port = TYPE[/CODE]; no port = every port, and the result lists the allowed and not-allowed ports. One test per line:
 <code>DIRECTION ADDRESS PROTOCOL [PORT]</code>, e.g. <code>ingress 10.1.2.3 tcp 443</code>,
 <code>egress 0.0.0.0/0 udp 53</code>, <code>both sg-0123... tcp 5432</code>, <code>in any all</code>.</div>
 <div class="controls">
@@ -292,6 +303,13 @@ Groups and rules used by the tester: <b data-t="oncount"></b>
 <button data-t="allon">All on</button></summary>
 <div class="muted" style="margin:6px 0">Untick a group or a rule to see the effect of removing it.</div>
 <div data-t="toggles"></div></details>
+<div class="controls">
+<label>Scenario name<input type="search" data-t="sname" placeholder="e.g. web to db, legacy group removed"></label>
+<label style="flex:1 1 320px">Notes<input type="search" data-t="snotes" style="max-width:none;width:100%"
+placeholder="change ticket, purpose, assumptions"></label>
+<button data-t="exphtml">Download scenario report</button><button data-t="expjson">Export scenario JSON</button>
+<button data-t="impbtn">Import scenario JSON</button><input type="file" data-t="impfile" accept=".json,application/json" hidden>
+</div>
 <div class="cards" data-t="cards"></div>
 <div class="wrap"><table data-t="out"></table></div>
 </section>
@@ -421,16 +439,68 @@ function fmtPP(pr, o) {
 }
 
 // --- evaluation ---
+const big = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+// Coalesce boxes that differ in one dimension only and touch there (mirrors lib.boxes.merge).
+function merge3(boxes) {
+  let bs = boxes, changed = true;
+  while (changed) {
+    changed = false;
+    for (let d = 0; d < 3; d++) {
+      const groups = new Map();
+      bs.forEach(b => { const k = b.filter((_, i) => i !== d).map(x => x.join("-")).join("|");
+        (groups.get(k) || groups.set(k, []).get(k)).push(b); });
+      const out = [];
+      for (const g of groups.values()) {
+        g.sort((x, y) => big(x[d][0], y[d][0]));
+        let cur = g[0];
+        for (const b of g.slice(1)) {
+          if (b[d][0] <= cur[d][1] + 1n) {
+            changed = true;
+            if (b[d][1] > cur[d][1]) { cur = cur.map(x => [...x]); cur[d][1] = b[d][1]; }
+          } else { out.push(cur); cur = b; }
+        }
+        out.push(cur);
+      }
+      bs = out;
+    }
+  }
+  return bs;
+}
+// Pieces [[space, box]] as text, ports listed per protocol for each address set:
+// "tcp 22, 443, 8000-8100; udp 53 from 10.1.2.3/32".
+function describe(pieces, prep) {
+  const bySpace = new Map();
+  pieces.forEach(([s, b]) => (bySpace.get(s) || bySpace.set(s, []).get(s)).push(b));
+  const byAddr = new Map();
+  for (const [s, bs] of bySpace) for (const b of merge3(bs)) {
+    const k = `${s}|${b[2][0]}|${b[2][1]}`;
+    (byAddr.get(k) || byAddr.set(k, {s, iv: b[2], pp: []}).get(k)).pp.push([b[0], b[1]]);
+  }
+  const byText = new Map();
+  for (const e of byAddr.values()) {
+    e.pp.sort((x, y) => big(x[0][0], y[0][0]) || big(x[1][0], y[1][0]));
+    const protos = new Map();
+    e.pp.forEach(([pr, o]) => {
+      const t = fmtPP(pr, o), m = /^(tcp|udp|icmp|icmpv6) (.*)$/.exec(t);
+      if (m) (protos.get(m[1]) || protos.set(m[1], []).get(m[1])).push(m[2]); else protos.set(t, null);
+    });
+    const text = [...protos].map(([n, ps]) => ps ? `${n} ${ps.join(", ")}` : n).join("; ");
+    (byText.get(text) || byText.set(text, []).get(text)).push(...cidrs(e.s, e.iv[0], e.iv[1]));
+  }
+  return [...byText].map(([t, a]) => `${t} ${prep} ${a.join(", ")}`);
+}
 function runLine(line, on) {
   const parts = line.trim().split(/\s+/);
   if (![3, 4].includes(parts.length) || !DIRS[parts[0].toLowerCase()])
-    return [{test: line, direction: "", verdict: "INVALID", by: [], off: [], rem: [],
+    return [{test: line, direction: "", verdict: "INVALID", by: [], off: [], ok: [], rem: [], okN: [], remN: [],
              detail: "expected: DIRECTION(ingress|egress|both) ADDRESS PROTOCOL [PORT]"}];
   let pp, addrs;
   try { pp = protoPorts(parts[2], parts[3]); addrs = addresses(parts[1]); }
-  catch (e) { return [{test: line, direction: "", verdict: "INVALID", by: [], off: [], rem: [], detail: String(e)}]; }
+  catch (e) { return [{test: line, direction: "", verdict: "INVALID", by: [], off: [], ok: [], rem: [], okN: [], remN: [],
+                       detail: String(e)}]; }
+  const noPort = parts.length === 3;
   return DIRS[parts[0].toLowerCase()].map(dir => {
-    const rs = rules.filter(r => r.dir === dir), hits = new Map(), offHits = new Map(), rem = [];
+    const rs = rules.filter(r => r.dir === dir), hits = new Map(), offHits = new Map(), rem = [], ok = [];
     for (const a of addrs) {
       const box = [pp[0], pp[1], [a.lo, a.hi]], cover = [];
       for (const r of rs) for (const x of r.bx) {
@@ -440,22 +510,20 @@ function runLine(line, on) {
       let pieces = [box];
       for (const c of cover) { pieces = pieces.flatMap(p => sub(p, c)); if (!pieces.length) break; }
       pieces.forEach(p => rem.push([a.space, p]));
+      // granted part = test box minus what is left (kept disjoint)
+      let granted = [box];
+      for (const p of pieces) { granted = granted.flatMap(g => sub(g, p)); if (!granted.length) break; }
+      granted.forEach(g => ok.push([a.space, g]));
     }
     const verdict = !rem.length ? "ALLOWED" : hits.size ? "PARTIAL" : "DENIED";
-    const prep = dir === "egress" ? "to" : "from", byPP = new Map();
-    if (verdict === "PARTIAL") {
-      const groups = new Map();
-      rem.forEach(([s, b]) => { const k = `${b[0]}|${b[1]}|${s}`; (groups.get(k) || groups.set(k, {s, b, r: []}).get(k)).r.push(b[2]); });
-      for (const {s, b, r} of groups.values()) {
-        r.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
-        const m = [];
-        r.forEach(iv => { const l = m[m.length - 1]; if (l && iv[0] <= l[1] + 1n) { if (iv[1] > l[1]) l[1] = iv[1]; } else m.push([...iv]); });
-        const k = fmtPP(b[0], b[1]);
-        byPP.set(k, (byPP.get(k) || []).concat(m.flatMap(iv => cidrs(s, iv[0], iv[1]))));
-      }
-    }
+    const prep = dir === "egress" ? "to" : "from", show = noPort || verdict === "PARTIAL";
+    const okT = show ? describe(ok, prep) : [], remT = show ? describe(rem, prep) : [];
+    // the test's own address written as "(tested address)", so tests that differ only by address group together
+    const own = new Set(addrs.flatMap(a => cidrs(a.space, a.lo, a.hi)));
+    const norm = xs => xs.map(x => { const i = x.lastIndexOf(` ${prep} `), as = x.slice(i + prep.length + 2).split(", ");
+      return i >= 0 && as.length === own.size && as.every(a => own.has(a)) ? `${x.slice(0, i)} ${prep} (tested address)` : x; });
     return {test: line, direction: dir, verdict, detail: "", by: [...hits.values()].map(ruleText),
-            off: [...offHits.values()].map(ruleText), rem: [...byPP].map(([k, a]) => `${k} ${prep} ${a.join(", ")}`)};
+            off: [...offHits.values()].map(ruleText), ok: okT, rem: remT, okN: norm(okT), remN: norm(remT)};
   });
 }
 const ruleText = r => `${r.g} ${r.id} ${r.text}` + (r.desc ? ` "${r.desc}"` : "");
@@ -474,11 +542,16 @@ $("toggles").innerHTML = T.groups.map(g => {
 }).join("");
 const boxes = sel => [...sec.querySelectorAll(sel)];
 const H = new URLSearchParams(location.hash.slice(1));
-$("lines").value = H.get("tests") || "";
+const rid = c => c.dataset.r.split("|")[1];
 $("lines").placeholder = "ingress 10.1.2.3 tcp 443\negress 0.0.0.0/0 udp 53";
-const offG = new Set((H.get("tests.goff") || "").split(",")), offR = new Set((H.get("tests.roff") || "").split(","));
-boxes("input[data-g]").forEach(c => c.checked = !offG.has(c.dataset.g));
-boxes("input[data-r]").forEach(c => c.checked = !offR.has(c.dataset.r.split("|")[1]));
+const offGroups = () => boxes("input[data-g]").filter(c => !c.checked).map(c => c.dataset.g);
+const offRules = () => boxes("input[data-r]").filter(c => !c.checked).map(rid);
+function setState(sc) {
+  $("sname").value = sc.name || ""; $("snotes").value = sc.notes || ""; $("lines").value = sc.tests || "";
+  const g = new Set(sc.groups_off || []), r = new Set(sc.rules_off || []);
+  boxes("input[data-g]").forEach(c => c.checked = !g.has(c.dataset.g));
+  boxes("input[data-r]").forEach(c => c.checked = !r.has(rid(c)));
+}
 function active() {
   const g = new Set(boxes("input[data-g]:checked").map(c => c.dataset.g));
   boxes("input[data-r]").forEach(c => c.disabled = !g.has(c.dataset.r.split("|")[0]));
@@ -487,9 +560,19 @@ function active() {
 function save() {
   const p = new URLSearchParams(location.hash.slice(1)), set = (k, v) => v ? p.set(k, v) : p.delete(k);
   set("tests", $("lines").value);
-  set("tests.goff", boxes("input[data-g]").filter(c => !c.checked).map(c => c.dataset.g).join(","));
-  set("tests.roff", boxes("input[data-r]").filter(c => !c.checked).map(c => c.dataset.r.split("|")[1]).join(","));
+  set("tests.goff", offGroups().join(","));
+  set("tests.roff", offRules().join(","));
+  set("tests.name", $("sname").value);
+  set("tests.notes", $("snotes").value);
   history.replaceState(null, "", "#" + p.toString());
+}
+// Results of a scenario evaluated on its own on/off state (independent of the checkboxes).
+function evaluate(sc) {
+  const g = new Set(sc.groups_off || []), r = new Set(sc.rules_off || []);
+  const on = new Set(rules.filter(x => !g.has(x.g) && !r.has(x.id)).map(x => x.key));
+  return (sc.tests || "").split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"))
+    .flatMap(l => runLine(l, on)).map(({test, direction, verdict, ok, rem, by, detail}) =>
+      ({test, direction, verdict, allowed: ok, not_allowed: rem, granted_by: by, detail}));
 }
 function run() {
   save();
@@ -499,16 +582,99 @@ function run() {
   const lines = $("lines").value.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
   const res = lines.flatMap(l => runLine(l, on));
   const n = v => res.filter(r => r.verdict === v).length;
-  $("cards").innerHTML = [[res.length, "results"], [n("ALLOWED"), "allowed"], [n("PARTIAL"), "partial"],
+  const rows = new Map();
+  res.forEach(r => { const k = JSON.stringify([r.direction, r.verdict, r.detail, r.by, r.off, r.okN, r.remN]);
+    (rows.get(k) || rows.set(k, []).get(k)).push(r); });
+  $("cards").innerHTML = [[res.length, "results"], [rows.size, "distinct results"], [n("ALLOWED"), "allowed"], [n("PARTIAL"), "partial"],
     [n("DENIED"), "denied"], [n("INVALID"), "invalid"], [on.size, "rules on"]]
     .map(([v, l]) => `<div class="card"><b>${v}</b><span>${l}</span></div>`).join("");
   const ul = xs => xs.length ? xs.map(esc).join("<br>") : "";
-  $("out").innerHTML = res.length ? `<tr><th>Test</th><th>Direction</th><th>Verdict</th><th>Granted by</th>` +
-    `<th>Not granted</th><th>Switched-off rules that match</th></tr>` + res.map(r =>
-    `<tr><td class="nw">${esc(r.test)}</td><td>${esc(r.direction)}</td>` +
-    `<td><span class="badge ${BADGE[r.verdict]}">${r.verdict}</span></td><td>${ul(r.by)}</td>` +
-    `<td>${r.detail ? esc(r.detail) : ul(r.rem)}</td><td>${ul(r.off)}</td></tr>`).join("") : "";
+  // tests with identical results share a row; a single test keeps its literal addresses
+  $("out").innerHTML = res.length ? `<tr><th>Tests</th><th>Direction</th><th>Verdict</th><th>Allowed</th>` +
+    `<th>Not allowed</th><th>Granted by</th><th>Switched-off rules that match</th></tr>` + [...rows.values()].map(g => {
+    const r = g[0], one = g.length === 1;
+    return `<tr><td class="nw">${ul(g.map(x => x.test))}</td><td>${esc(r.direction)}</td>` +
+      `<td><span class="badge ${BADGE[r.verdict]}">${r.verdict}</span>${one ? "" : ` <span class="muted">&times;${g.length}</span>`}</td>` +
+      `<td>${ul(one ? r.ok : r.okN)}</td><td>${r.detail ? esc(r.detail) : ul(one ? r.rem : r.remN)}</td>` +
+      `<td>${ul(r.by)}</td><td>${ul(r.off)}</td></tr>`; }).join("") : "";
 }
+// --- scenarios: export for others, import, evidence check ---
+const dataText = document.getElementById("extra-data").textContent;
+const fingerprint = (async () => {
+  if (!(window.crypto && crypto.subtle)) return null;
+  const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(dataText));
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
+})();
+const SCOPE = "Security groups only: network ACLs, route tables, firewalls and the far end's security groups " +
+  "are not evaluated. Rules and prefix lists as of the report time.";
+async function current() {
+  const st = {tests: $("lines").value, groups_off: offGroups(), rules_off: offRules()};
+  return {format: "sg_rule_inventory.scenario/1", name: $("sname").value.trim(), notes: $("snotes").value.trim(),
+          ...st, exported: new Date().toISOString(),
+          report: {account: T.report.account, generated: T.report.generated, groups: T.groups.map(g => g.id),
+                   rule_data_sha256: await fingerprint},
+          results: evaluate(st)};
+}
+const slug = s => (s || "scenario").replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60);
+function download(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], {type}));
+  a.download = name; a.click();
+}
+async function evidence(sc, how) {
+  const fp = await fingerprint, ids = new Set(rules.map(r => r.id)), gids = new Set(T.groups.map(g => g.id));
+  const unknown = [...(sc.groups_off || []).filter(g => !gids.has(g)), ...(sc.rules_off || []).filter(r => !ids.has(r))];
+  const exp = (sc.report || {}).rule_data_sha256;
+  const now = JSON.stringify(evaluate(sc)), then = JSON.stringify(sc.results || []);
+  const B = (cls, t) => `<span class="badge ${cls}">${esc(t)}</span>`;
+  const checks = [
+    !fp ? B("warn", "rule data not checked (browser has no crypto.subtle)")
+      : exp === fp ? B("ok", "same rule data as when exported") : B("error", "rule data differs from when exported"),
+    now === then ? B("ok", `results reproduced: ${(sc.results || []).length} result(s) identical`)
+      : B("error", "results differ from the exported results"),
+    unknown.length ? B("error", `${unknown.length} switched-off group(s)/rule(s) not in this report: ${unknown.join(", ")}`) : "",
+  ].filter(Boolean).join(" ");
+  const offG = sc.groups_off || [], offR = sc.rules_off || [];
+  const offText = !offG.length && !offR.length ? "nothing: every rule of every group is on"
+    : [...offG.map(g => `group ${g}`), ...offR.map(r => { const x = rules.find(y => y.id === r);
+        return x ? `${x.g} ${x.id} ${x.text}` : r; })].join("; ");
+  const res = sc.results || [], cnt = v => res.filter(r => r.verdict === v).length;
+  $("evidence").innerHTML = `<div class="card" style="margin:8px 0;padding:12px 16px">
+    <div><strong style="font-size:16px">Scenario${sc.name ? ": " + esc(sc.name) : ""}</strong> <span class="muted">(${esc(how)})</span></div>
+    ${sc.notes ? `<div>${esc(sc.notes)}</div>` : ""}
+    <div class="muted">Exported ${esc(sc.exported || "?")} from the report for account ${esc((sc.report || {}).account || "?")}
+      generated ${esc((sc.report || {}).generated || "?")}. Rule data SHA-256 ${esc(fp || "n/a")}.</div>
+    <div style="margin:6px 0">Exported results: ${cnt("ALLOWED")} allowed, ${cnt("PARTIAL")} partial,
+      ${cnt("DENIED")} denied, ${cnt("INVALID")} invalid.</div>
+    <div style="margin:6px 0">${checks}</div>
+    <div><strong>Switched off:</strong> ${esc(offText)}</div>
+    <div class="muted" style="margin-top:6px">${esc(SCOPE)}</div></div>`;
+}
+$("exphtml").addEventListener("click", async () => {
+  const sc = await current();
+  const doc = document.documentElement.cloneNode(true);
+  doc.querySelector("#app").innerHTML = "";
+  doc.querySelectorAll("#scenario").forEach(x => x.remove());
+  const tag = document.createElement("script");
+  tag.id = "scenario"; tag.type = "application/json";
+  tag.textContent = JSON.stringify(sc).replace(/<\//g, "<\\/");
+  doc.querySelector("#extra-data").after(tag);
+  doc.querySelector("title").textContent = `Scenario${sc.name ? ": " + sc.name : ""} - ${document.title}`;
+  download(`sg_scenario_${slug(sc.name)}.html`, "<!doctype html>\n" + doc.outerHTML, "text/html");
+});
+$("expjson").addEventListener("click", async () =>
+  download(`sg_scenario_${slug($("sname").value)}.json`, JSON.stringify(await current(), null, 2), "application/json"));
+$("impbtn").addEventListener("click", () => $("impfile").click());
+$("impfile").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const sc = JSON.parse(await f.text());
+    if (sc.format !== "sg_rule_inventory.scenario/1") throw "not an sg_rule_inventory scenario file";
+    setState(sc); run(); evidence(sc, `imported from ${f.name}`);
+  } catch (err) { $("evidence").innerHTML = `<div class="card"><span class="badge error">import failed</span> ${esc(String(err))}</div>`; }
+  e.target.value = "";
+});
 $("add").addEventListener("click", () => {
   const a = $("addr").value.trim();
   if (!a) return $("addr").focus();
@@ -522,24 +688,46 @@ $("clear").addEventListener("click", () => { $("lines").value = ""; run(); });
 $("allon").addEventListener("click", e => { e.preventDefault(); boxes("input[data-g], input[data-r]").forEach(c => c.checked = true); run(); });
 $("lines").addEventListener("input", run);
 sec.addEventListener("change", e => { if (e.target.dataset.g || e.target.dataset.r) run(); });
+$("sname").addEventListener("input", save);
+$("snotes").addEventListener("input", save);
+// start from the URL fragment if it holds a view, else from a scenario embedded by "Download scenario report"
+const embedded = document.getElementById("scenario");
+const fromHash = ["tests", "tests.goff", "tests.roff", "tests.name", "tests.notes"].some(k => H.has(k));
+if (fromHash) setState({name: H.get("tests.name"), notes: H.get("tests.notes"), tests: H.get("tests"),
+  groups_off: (H.get("tests.goff") || "").split(",").filter(Boolean), rules_off: (H.get("tests.roff") || "").split(",").filter(Boolean)});
+let shared = null;
+if (embedded) {
+  try { shared = JSON.parse(embedded.textContent); } catch (err) { shared = null; }
+  if (shared && !fromHash) setState(shared);
+}
 run();
+if (shared) evidence(shared, fromHash ? "embedded in this file; the view below comes from the URL" : "embedded in this file");
 })();
 """
 
 
-def tester_data(groups: list[SG], rules: dict[str, list[SgRule]], prefix_lists: dict[str, list[str]]) -> dict:
-    """Groups, rules with their boxes (addresses as decimal strings, IPv6 needs BigInt) and
-    prefix list entries for the HTML tester."""
-    return {"groups": [{"id": g.group_id, "name": g.name} for g in groups],
+def tester_data(payload: dict, groups: list[SG], rules: dict[str, list[SgRule]],
+                prefix_lists: dict[str, list[str]]) -> tuple[str, str]:
+    """The HTML tester's data as embedded JSON text, and its SHA-256.
+
+    The data holds the report identity, groups, rules with their boxes (addresses as decimal
+    strings, IPv6 needs BigInt) and prefix list entries. The hash is taken over the exact
+    embedded text, so the page can recompute it and an exported scenario can be tied back to
+    this run (the text and JSON reports print the same value). It is a consistency check,
+    not a signature.
+    """
+    data = {"report": {"account": payload["account"], "generated": payload["generated"]},
+            "groups": [{"id": g.group_id, "name": g.name} for g in groups],
             "prefix_lists": prefix_lists,
             "rules": [{"g": g.group_id, "id": r.rule_id, "dir": r.direction, "text": str(r), "desc": r.description,
                        "boxes": [[sp, b[0][0], b[0][1], b[1][0], b[1][1], str(b[2][0]), str(b[2][1])]
                                  for sp, b in r.boxes]}
                       for g in groups for r in rules[g.group_id]]}
+    text = json.dumps(data, default=str).replace("</", "<\\/")
+    return text, hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], groups: list[SG],
-                rules: dict[str, list[SgRule]], prefix_lists: dict[str, list[str]]) -> str:
+def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], tester_text: str) -> str:
     """Interactive HTML: access tester, groups, rules (filter/sort by group), combined access."""
     gs = payload["groups"]
     group_rows = [{**g, "ingress": sum(r.group_id == g["group_id"] and r.direction == "ingress" for r in rows),
@@ -583,7 +771,7 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], groups
                                       ["region", "Region"], ["groups", "Groups"], ["description", "Description"]],
                           "rows": payload["interfaces"], "wrap": ["description"], "sort": [["eni_id", 1]]})
     meta = [f"Account {payload['account']} via {via_text(payload)} · generated {payload['generated']} · "
-            "read-only report"]
+            "read-only report", f"Rule data SHA-256 {payload['rule_data_sha256']}"]
     meta += [f"Warning: prefix list {w}; matched by id only" for w in payload["warnings"]]
     cards = [(len(gs), "groups"), (len(payload["interfaces"]), "interfaces"),
              (sum(r.direction == "ingress" for r in rows), "ingress rules"),
@@ -592,7 +780,7 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], groups
              (len({g["vpc_id"] for g in gs}), "VPCs")]
     return html_report.render("Security group rule inventory", meta=meta, cards=cards, tables=tables,
                               extra_html=TESTER_HTML, extra_script=TESTER_JS,
-                              extra_data=tester_data(groups, rules, prefix_lists))
+                              extra_data=tester_text)
 
 
 # --------------------------------------------------------------------------- #
@@ -666,6 +854,7 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
                "interfaces": interfaces, "warnings": warnings,
                "groups": [{**asdict(g), "via": via.get(g.group_id, [])} for g in groups],
                "rules": [asdict(r) for r in rows], "combined_access": combined}
+    tester_text, payload["rule_data_sha256"] = tester_data(payload, groups, rules, pls)
 
     slug = groups[0].group_id if len(groups) == 1 else f"{groups[0].group_id}_and_{len(groups) - 1}_more"
     if interfaces and len(interfaces) == len(targets):
@@ -676,7 +865,7 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
     if paths["csv"]:
         write_csv(paths["csv"], [asdict(r) for r in rows], CSV_COLUMNS)
     if paths["html"]:
-        write_text(paths["html"], render_html(payload, rows, combined, groups, rules, pls))
+        write_text(paths["html"], render_html(payload, rows, combined, tester_text))
 
     if args.json:
         print(json.dumps(payload, indent=2, default=str))

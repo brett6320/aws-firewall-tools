@@ -235,7 +235,8 @@ def render(title: str, *, meta: list[str] | None = None, cards: list[tuple] | No
     """Return the complete HTML document for a report (see the module docstring for the table spec).
 
     extra_html is inserted between the summary cards and the tables; extra_script runs after
-    the tables are drawn and can read `extra_data` as JSON from the element #extra-data.
+    the tables are drawn and can read `extra_data` as JSON from the element #extra-data
+    (a str is taken as JSON text and embedded unchanged).
     """
     data = {"title": title, "meta": meta or [], "cards": [list(c) for c in cards or []], "tables": tables,
             "extra_html": extra_html}
@@ -243,8 +244,9 @@ def render(title: str, *, meta: list[str] | None = None, cards: list[tuple] | No
     payload = json.dumps(data, default=str).replace("</", "<\\/")
     extra = ""
     if extra_data is not None:
-        extra = ('<script id="extra-data" type="application/json">'
-                 + json.dumps(extra_data, default=str).replace("</", "<\\/") + "</script>")
+        # a str is embedded as-is (already JSON; "</" escaping is idempotent), e.g. when the caller hashes it
+        text = extra_data if isinstance(extra_data, str) else json.dumps(extra_data, default=str)
+        extra = '<script id="extra-data" type="application/json">' + text.replace("</", "<\\/") + "</script>"
     # Fill each placeholder once, in template order, so data can never be mistaken for one.
     out, rest = [], TEMPLATE
     for marker, value in (("__TITLE__", title.replace("&", "&amp;").replace("<", "&lt;")),
