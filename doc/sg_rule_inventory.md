@@ -92,7 +92,7 @@ in any all                         all traffic from anywhere (IPv4 and IPv6)
 | `DIRECTION` | `ingress` / `in`, `egress` / `out`, or `both` |
 | `ADDRESS` | An IP, a CIDR, `any`, a group id or a prefix list id. For ingress it is the source; for egress, the destination |
 | `PROTOCOL` | `tcp`, `udp`, `icmp`, `icmpv6`, `all`, or a protocol number |
-| `PORT` | Destination port or range (`443`, `8000-8100`). For ICMP it is `TYPE` or `TYPE/CODE`. Leave it out to test every port |
+| `PORT` | Destination port or range (`443`, `8000-8100`). For ICMP it is `TYPE` or `TYPE/CODE`. Leave it out to test every port and get the allowed and not-allowed ports listed |
 
 How addresses are matched:
 - A group id matches rules that reference that group, including a group's
@@ -106,16 +106,48 @@ Each result shows:
 | Column | Meaning |
 |---|---|
 | Verdict | `ALLOWED`: all of the tested traffic is granted. `PARTIAL`: only some of it (for example, a CIDR or port range that is only partly covered). `DENIED`: none of it. `INVALID`: the line could not be parsed |
+| Allowed / Not allowed | Filled when no port was given, or when the result is `PARTIAL`. Ports are listed per protocol for each address set, for example `tcp 22, 443, 8000-8100; udp 53 from 10.1.2.3/32` |
 | Granted by | The switched-on rules that match the traffic |
-| Not granted | For `PARTIAL`, exactly what is not granted (merged CIDRs per protocol/port) |
 | Switched-off rules that match | Rules that are switched off but would have matched |
+
+Tests with identical results share one row, and the verdict shows how many
+tests the row covers (`×3`).
+- A test's own address appears as `(tested address)`. So `in 10.1.2.3 tcp` and `in 10.1.2.4 tcp` share a row when the same ports are allowed for both, through the same rules.
+- Results that cover only part of an address keep the exact CIDRs. They share a row only when they are identical.
 
 **Switching groups and rules off.** Every group and rule has a checkbox.
 Untick one to see what the set would allow without it. "All on" restores
 everything.
 
-The tests and the switched-off groups and rules are kept in the URL fragment,
-so a scenario can be bookmarked.
+The tests, the switched-off groups and rules, and the scenario name and notes
+are kept in the URL fragment, so a scenario can be bookmarked.
+
+### Sharing a scenario as evidence
+
+To show other engineers that a path is open (or closed), give the scenario
+a name and notes, for example a change ticket, then:
+
+| Button | Gives you |
+|---|---|
+| **Download scenario report** | A copy of this HTML report that opens on the scenario. It is a single self-contained file to attach to a ticket or email; the recipient needs nothing else |
+| **Export scenario JSON** | The scenario alone (`format: sg_rule_inventory.scenario/1`): tests, switched-off groups and rules, name, notes, report identity, and the results at export time |
+| **Import scenario JSON** | Loads such a file into a report and checks it the same way |
+
+When a scenario report is opened, or a scenario JSON is imported, a panel at
+the top of the tester shows:
+- the name, notes, export time, and the source report's account and generation time;
+- whether the **rule data** matches the scenario. The SHA-256 of the embedded rule data is recomputed and compared with the value stored at export;
+- whether the **results are reproduced**. The tests are run again on the scenario's on/off state and compared with the exported results;
+- **switched-off** groups and rules, listed explicitly ("nothing" when every rule was on). Switched-off ids that are not in the report are flagged;
+- the scope: security groups only. Network ACLs, route tables, firewalls and the far end's security groups are not evaluated.
+
+The same SHA-256 appears in the report header, the text report and the JSON
+(`rule_data_sha256`) of the run that made the report. A recipient can match
+an exported scenario to that run.
+
+This is a consistency check, not a signature. It shows the file was not
+changed by accident and ties it to a run, but anyone who can edit the file
+could recompute the hash.
 
 ## Options
 
@@ -132,12 +164,12 @@ Plus the common output flags, described under [Reports](../README.md#reports).
 ## Output
 
 - **Text**:
-  - which account and profile were used;
+  - which account and profile were used, and the rule data SHA-256;
   - interfaces and their groups;
   - each group's rules by direction, with descriptions and *also granted*;
   - the combined access per direction. Long CIDR lists are cut at 8; the files hold everything.
 - **CSV**: one row per rule. List cells are `; `-separated.
-- **JSON**: `{account, profile, profile_source, generated, interfaces, warnings, groups, rules, combined_access}`.
+- **JSON**: `{account, profile, profile_source, generated, interfaces, warnings, groups, rules, combined_access, rule_data_sha256}`.
 - **HTML**: the sections above.
 
 Reports are saved under `reports/sg_rule_inventory/YYYY-MM-DD/`.
