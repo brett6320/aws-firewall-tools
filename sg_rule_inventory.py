@@ -12,9 +12,11 @@ all their rules. For reporting only: read-only, no changes are made in AWS.
 
 What it does:
 
-  1. Takes any number of security group ids / ARNs and network interface
-     ids / ARNs (an interface stands for the groups attached to it), all in
-     one account.
+  1. Takes any number of targets, in one or more accounts (several accounts
+     via ARNs): security group ids / ARNs; network interface ids / ARNs (an
+     interface stands for its groups); EC2 instance ids / ARNs (each of its
+     interfaces); Lambda function ARNs (the groups in its VPC configuration;
+     a function outside a VPC has none and is skipped with a warning).
   2. Reads every rule (describe_security_group_rules) and expands prefix
      lists to their current CIDRs.
   3. Reports:
@@ -59,11 +61,13 @@ is the destination port. A missing PORT tests every port and lists which
 ports / ranges are allowed and which are not. Group references
 are matched by group id only (the report cannot know the members' addresses).
 
-Profile: --profile if given. Otherwise the account in the ARNs selects the
-local profile for that account (found by account id; profiles ending in -priv
-or -cpar are never used; --account-profile forces one). With bare ids only,
-AWS_PROFILE or the default credentials. The profile's account is verified
-with sts:GetCallerIdentity before anything is read.
+Profiles: each account is read with its own profile. --profile is used for
+its own account; every other account named by an ARN uses its local profile
+(found by account id; profiles ending in -priv or -cpar are never used;
+--account-profile forces one). Bare ids belong to the --profile account, else
+to the single ARN account, else (no ARNs) to AWS_PROFILE or the default
+credentials; next to ARNs from several accounts they are refused as
+ambiguous. Every profile is verified with sts:GetCallerIdentity first.
 
 Configuration (.env, all optional; CLI flags override):
 
@@ -86,7 +90,7 @@ Usage:
 Exit codes: 0 ok, 1 the interfaces differ or a referenced prefix list could not be
 read, 2 fatal error.
 
-Read-only. Only Describe / Get calls are made.
+Read-only. Only Describe / Get calls are made (EC2, Lambda GetFunctionConfiguration, STS).
 """
 from __future__ import annotations
 
@@ -113,8 +117,8 @@ from lib.accounts import add_profile_args, check_profile_args  # noqa: E402
 from lib.boxes import PROTO_NAMES, Box, fmt_addrs, fmt_proto_ports, intersects, merge, remainder  # noqa: E402
 from lib.output import (add_output_args, print_saved, report_paths, setup_logging, write_csv,  # noqa: E402
                         write_json, write_text)
-from lib.security_groups import (SG, SgRule, check_account, load_groups, parse_targets,  # noqa: E402
-                                 resolve_enis, resolve_profile, spec_accounts)
+from lib.security_groups import (SG, SgRule, load_groups, parse_account_targets,  # noqa: E402
+                                 resolve_account_profiles, resolve_workloads, split_specs, spec_accounts)
 
 log = logging.getLogger("sg_rule_inventory")
 TOOL = "sg_rule_inventory"
@@ -162,6 +166,7 @@ class RuleRow:
     """One rule as reported (CSV row, rules table row)."""
     group_id: str
     group_name: str
+    account: str
     direction: str
     rule_id: str
     protocol: str
@@ -195,7 +200,7 @@ def rule_rows(groups: list[SG], rules: dict[str, list[SgRule]]) -> list[RuleRow]
         for r in rules[g.group_id]:
             others = [o for o in every if o.egress == r.egress and o is not r]
             level, hits = also_granted(r, others)
-            out.append(RuleRow(g.group_id, g.name, r.direction, r.rule_id, proto_label(r), r.access(), r.peer,
+            out.append(RuleRow(g.group_id, g.name, g.owner, r.direction, r.rule_id, proto_label(r), r.access(), r.peer,
                                r.peer_kind, r.peer_label, r.description, str(r), level,
                                [f"{o.group_id} ({names.get(o.group_id, '')}) {o.rule_id} {o}" for o in hits]))
     return out
@@ -248,12 +253,12 @@ def interface_deltas(interfaces: list[dict], rules: dict[str, list[SgRule]]) -> 
     all, and access (protocol / ports x addresses) allowed on some but not all, with the rules
     responsible. Each interface's access is the union of its groups' rules, compared exactly,
     so the same access written differently is not a difference."""
-    enis = [n["eni_id"] for n in interfaces]
+    enis = [n["id"] for n in interfaces]
     out = {"interfaces": enis, "groups": [], "access": []}
     if len(enis) < 2:
         return out
     every = set(enis)
-    on = {n["eni_id"]: set(n["groups"]) for n in interfaces}
+    on = {n["id"]: set(n["groups"]) for n in interfaces}
     for gid in sorted(set().union(*on.values())):
         has = [e for e in enis if gid in on[e]]
         if len(has) < len(enis):
@@ -300,10 +305,15 @@ def known_prefix_lists(rules: dict[str, list[SgRule]]) -> dict[str, list[str]]:
 # Output
 # --------------------------------------------------------------------------- #
 def via_text(payload: dict) -> str:
-    """How the account was read, e.g. 'profile acct-ro (local profile for account 1111...)'."""
-    if not payload["profile"]:
-        return "default credentials"
-    return f"profile {payload['profile']} ({payload['profile_source']})"
+    """How the account(s) were read, e.g. 'profile acct-ro (local profile for account 1111...)',
+    or one 'account via profile' per account."""
+    def one(p, src):
+        """'profile x (how chosen)' or 'default credentials'."""
+        return f"profile {p} ({src})" if p else "default credentials"
+    if len(payload["accounts"]) == 1:
+        a = payload["accounts"][0]
+        return one(a["profile"], a["profile_source"])
+    return "; ".join(f"{a['account']} via {one(a['profile'], a['profile_source'])}" for a in payload["accounts"])
 
 
 def cut(addrs: list[str]) -> str:
@@ -317,16 +327,24 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_
     counts of combined access entries and interface differences. Anything listing rules or
     access (per-group rules, combined access, interface access differences and the rules behind
     them) only with show_rules; the saved HTML / CSV / JSON always hold everything."""
-    print(f"\nAccount {payload['account']} via {via_text(payload)}")
+    if len(payload["accounts"]) > 1:
+        print(f"\nAccounts: {via_text(payload)}")
+    else:
+        print(f"\nAccount {payload['account']} via {via_text(payload)}")
     print(f"Rule data SHA-256 {payload['rule_data_sha256']} (shown in the HTML report and in exported scenarios)")
     for w in payload["warnings"]:
         print(f"[WARN ] PREFIX_LIST_UNRESOLVED {w}; matched by id only")
+    for w in payload["target_warnings"]:
+        print(f"[WARN ] {w}")
     for n in payload["interfaces"]:
-        print(f"interface {n['eni_id']} ({n['attachment'] or '-'}, {n['vpc_id']}, {n['region']}) "
+        label = "lambda" if n["kind"] == "lambda" else "interface"
+        acct = f"{n['account']}, " if len(payload["accounts"]) > 1 else ""
+        print(f"{label} {n['id']} ({n['attachment'] or '-'}, {acct}{n['vpc_id']}, {n['region']}) "
               f"-> {', '.join(n['groups']) or '(no groups)'}")
     for g in payload["groups"]:
         rs = [r for r in rows if r.group_id == g["group_id"]]
-        line = (f"{g['group_id']} ({g['name']}, {g['vpc_id']}, {g['region']})  "
+        acct = f"{g['owner']}, " if len(payload["accounts"]) > 1 else ""
+        line = (f"{g['group_id']} ({g['name']}, {acct}{g['vpc_id']}, {g['region']})  "
                 f"{sum(r.direction == 'ingress' for r in rs)} in / {sum(r.direction == 'egress' for r in rs)} out"
                 + (f"  via {', '.join(g['via'])}" if g["via"] else ""))
         if not show_rules:
@@ -350,9 +368,9 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_
               f"{count(combined, 'egress')} egress protocol/port entries")
         if len(d["interfaces"]) >= 2:
             if not d["groups"] and not d["access"]:
-                print(f"Interfaces: no differences; all {len(d['interfaces'])} allow exactly the same access")
+                print(f"Interfaces / functions: no differences; all {len(d['interfaces'])} allow exactly the same access")
             else:
-                print(f"Interfaces: {len(d['groups'])} group attachment difference(s), {len(d['access'])} access "
+                print(f"Interfaces / functions: {len(d['groups'])} group attachment difference(s), {len(d['access'])} access "
                       f"difference(s) ({count(d['access'], 'ingress')} ingress / {count(d['access'], 'egress')} egress)")
                 for e in d["interfaces"]:
                     lacks = sum(e in a["missing_on"] for a in d["access"])
@@ -370,7 +388,7 @@ def print_report(payload: dict, rows: list[RuleRow], combined: list[dict], show_
             print(f"    {c['access']} {prep} {cut(c['addresses'])}   [{', '.join(c['granted_by'])}]")
     if len(d["interfaces"]) < 2:
         return
-    print(f"\n=== differences between {len(d['interfaces'])} interfaces")
+    print(f"\n=== differences between {len(d['interfaces'])} interfaces / functions")
     if not d["groups"] and not d["access"]:
         print("  none: every interface allows exactly the same access")
     for g in d["groups"]:
@@ -1070,20 +1088,21 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], tester
                    "egress": sum(r.group_id == g["group_id"] and r.direction == "egress" for r in rows)} for g in gs]
     tables = [
         {"id": "g", "title": "Groups", "row_label": "groups",
-         "columns": [["group_id", "Group"], ["name", "Name"], ["vpc_id", "VPC"], ["region", "Region"],
+         "columns": [["group_id", "Group"], ["name", "Name"], ["owner", "Account"], ["vpc_id", "VPC"], ["region", "Region"],
                      ["via", "Via interface"], ["ingress", "Ingress rules"], ["egress", "Egress rules"],
                      ["description", "Description"]],
-         "rows": group_rows, "filters": ["vpc_id", "region", "via"], "wrap": ["description"],
-         "uniq": [["vpc_id", "VPCs"], ["region", "regions"]], "sort": [["group_id", 1]]},
+         "rows": group_rows, "filters": ["owner", "vpc_id", "region", "via"], "wrap": ["description"],
+         "uniq": [["owner", "accounts"], ["vpc_id", "VPCs"], ["region", "regions"]], "sort": [["group_id", 1]]},
         {"id": "r", "title": "Rules", "row_label": "rules",
          "note": "Every rule of every group. 'Also granted' = how much of the rule's access other rules in this "
                  "collection grant too (fully = removing it changes nothing). Descriptions are for reference.",
-         "columns": [["group_id", "Group"], ["group_name", "Group name"], ["direction", "Direction"],
+         "columns": [["group_id", "Group"], ["group_name", "Group name"], ["account", "Account"], ["direction", "Direction"],
                      ["rule_id", "Rule ID"], ["protocol", "Protocol"], ["access", "Ports"], ["peer", "Peer"],
                      ["peer_kind", "Peer type"], ["peer_label", "Prefix list"], ["description", "Description"],
                      ["also_granted", "Also granted"], ["overlaps", "Overlapping rules"]],
          "rows": [asdict(r) for r in rows],
-         "filters": ["group_id", "group_name", "direction", "protocol", "access", "peer", "peer_kind", "also_granted"],
+         "filters": ["group_id", "group_name", "account", "direction", "protocol", "access", "peer", "peer_kind",
+                     "also_granted"],
          "wrap": ["description", "overlaps"],
          "badges": {"also_granted": {"fully": "warn", "partly": "info"}},
          "order": {"direction": ["ingress", "egress"], "also_granted": ["no", "partly", "fully"]},
@@ -1105,7 +1124,7 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], tester
     if len(d["interfaces"]) >= 2:
         tables.insert(0, {
             "id": "d", "title": "Interface differences", "row_label": "differences",
-            "note": f"Access allowed on some of the {len(d['interfaces'])} interfaces but not on others. Each interface's "
+            "note": f"Access allowed on some of the {len(d['interfaces'])} interfaces / functions but not on others. Each one's "
                     "access is the union of its groups' rules, compared exactly (the same access written differently "
                     "is not a difference). Rules = the rules on the allowing interfaces that grant it. "
                     + ("No differences: every interface allows exactly the same access." if not d["access"] else ""),
@@ -1113,29 +1132,34 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], tester
                         ["allowed_on", "Allowed on"], ["missing_on", "Not allowed on"], ["rules", "Rules"]],
             "rows": d["access"], "filters": ["direction", "access", "allowed_on", "missing_on"],
             "wrap": ["addresses", "rules", "allowed_on", "missing_on"], "order": {"direction": ["ingress", "egress"]},
-            "uniq": [["access", "protocol/ports"], ["missing_on", "interfaces missing access"]],
-            "by": {"key": "missing_on", "label": "By interface missing access", "badge": None},
+            "uniq": [["access", "protocol/ports"], ["missing_on", "interfaces / functions missing access"]],
+            "by": {"key": "missing_on", "label": "By interface / function missing access", "badge": None},
             "sort": [["direction", 1], ["access", 1]]})
         if d["groups"]:
             tables.insert(0, {
                 "id": "ga", "title": "Group attachment differences", "row_label": "groups",
-                "note": "Groups attached to some of the interfaces but not all.",
+                "note": "Groups attached to some of the interfaces / functions but not all.",
                 "columns": [["group_id", "Group"], ["attached_to", "Attached to"], ["missing_on", "Not attached to"]],
                 "rows": d["groups"], "filters": ["missing_on"], "wrap": ["attached_to", "missing_on"],
                 "sort": [["group_id", 1]]})
     if payload["interfaces"]:
-        tables.insert(0, {"id": "i", "title": "Interfaces", "row_label": "interfaces",
-                          "columns": [["eni_id", "Interface"], ["attachment", "Attached to"], ["vpc_id", "VPC"],
+        tables.insert(0, {"id": "i", "title": "Interfaces and functions", "row_label": "interfaces / functions",
+                          "columns": [["id", "Interface / function"], ["kind", "Type"], ["account", "Account"],
+                                      ["attachment", "Attached to"], ["vpc_id", "VPC"],
                                       ["region", "Region"], ["groups", "Groups"], ["description", "Description"]],
-                          "rows": payload["interfaces"], "wrap": ["description"], "sort": [["eni_id", 1]]})
-    meta = [f"Account {payload['account']} via {via_text(payload)} · generated {payload['generated']} · "
+                          "rows": payload["interfaces"], "wrap": ["description", "attachment"], "filters": ["kind", "account"],
+                          "sort": [["id", 1]]})
+    who = (f"Accounts: {via_text(payload)}" if len(payload["accounts"]) > 1
+           else f"Account {payload['account']} via {via_text(payload)}")
+    meta = [f"{who} · generated {payload['generated']} · "
             "read-only report", f"Rule data SHA-256 {payload['rule_data_sha256']}"]
     meta += [f"Warning: prefix list {w}; matched by id only" for w in payload["warnings"]]
-    cards = [(len(gs), "groups"), (len(payload["interfaces"]), "interfaces"),
+    meta += [f"Warning: {w}" for w in payload["target_warnings"]]
+    cards = [(len(gs), "groups"), (len(payload["interfaces"]), "interfaces / functions"),
              (sum(r.direction == "ingress" for r in rows), "ingress rules"),
              (sum(r.direction == "egress" for r in rows), "egress rules"),
              (sum(r.also_granted == "fully" for r in rows), "fully overlapped rules"),
-             (len({g["vpc_id"] for g in gs}), "VPCs")]
+             (len({g["vpc_id"] for g in gs}), "VPCs"), (len(payload["accounts"]), "accounts")]
     if len(d["interfaces"]) >= 2:
         cards.append((len(d["access"]), "interface access differences"))
     return html_report.render("Security group rule inventory", meta=meta, cards=cards, tables=tables,
@@ -1149,7 +1173,8 @@ def render_html(payload: dict, rows: list[RuleRow], combined: list[dict], tester
 def main() -> int:
     """Command-line entry point. Returns 0 ok, 1 interfaces differ or a prefix list could not be read, 2 fatal."""
     p = argparse.ArgumentParser(
-        description="Report every rule of a set of security groups (or the groups on network interfaces), "
+        description="Report every rule of a set of security groups (or the groups on network interfaces, EC2 "
+                    "instances or Lambda functions, in one or more accounts), "
                     "and their combined access, with an interactive traffic tester in the HTML report. Read-only.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
@@ -1159,12 +1184,13 @@ def main() -> int:
 
 Traffic tests are run in the HTML report (no AWS access needed once it is saved).
 """)
-    p.add_argument("targets", nargs="+", metavar="SG_OR_ENI",
-                   help="Security group or network interface ids / ARNs (comma-separated also accepted); "
-                        "an interface stands for its attached groups")
+    p.add_argument("targets", nargs="+", metavar="TARGET",
+                   help="Security group, network interface or EC2 instance ids / ARNs, or Lambda function ARNs "
+                        "(comma-separated also accepted). An interface stands for its groups; an instance for each "
+                        "of its interfaces; a function for the groups in its VPC configuration")
     p.add_argument("--profile", default=None,
-                   help="AWS profile. Default: the local profile for the account in the ARNs "
-                        "(never -priv/-cpar), else AWS_PROFILE")
+                   help="AWS profile, used for its own account (and for bare ids). Other accounts named by "
+                        "ARNs use their local profiles (never -priv/-cpar); with no ARNs, default AWS_PROFILE")
     p.add_argument("--region", default=os.getenv("AWS_REGION") or None,
                    help="Region for bare ids (default AWS_REGION, then the profile's region)")
     p.add_argument("--show-rules", action="store_true",
@@ -1178,26 +1204,36 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
     check_profile_args(p, args)
 
     try:
-        accounts = spec_accounts(args.targets)
-        if len(accounts) > 1:
-            raise ValueError(f"all targets must be in one account; ARNs name {', '.join(sorted(accounts))}")
-        account = next(iter(accounts), None)
-        profile, source = resolve_profile(args, account)
-        default_region = args.region or boto3.Session(profile_name=profile).region_name
-        targets, _ = parse_targets(args.targets, default_region, min_groups=1, allow_enis=True)
-        caller = check_account(profile, targets[0][0], account)
-        log.info("Account %s via %s (%s)", caller, profile or "default credentials", source)
+        arn_accounts = spec_accounts(args.targets)
+        bare_ids = any(not t.startswith("arn:") for t in split_specs(args.targets))
+        profiles, bare_account = resolve_account_profiles(args, arn_accounts, bare_ids)
+        default_region = args.region or (boto3.Session(profile_name=profiles[bare_account][0]).region_name
+                                         if bare_account else None)
+        targets = parse_account_targets(args.targets, default_region)
+        for account, (profile, source) in sorted(profiles.items()):
+            log.info("Account %s via %s (%s)", account, profile or "default credentials", source)
 
-        def session(region):
-            """boto3 session for the chosen profile in `region`."""
-            return boto3.Session(profile_name=profile, region_name=region)
-        group_targets, interfaces = resolve_enis(session, targets)
-        if not group_targets:
-            raise ValueError("no security groups: the interfaces given have none attached")
-        groups, rules, warnings = load_groups(session, group_targets)
-        owners = {g.owner for g in groups}
-        if len(owners) > 1:
-            raise ValueError(f"security groups must be in one account; owners: {', '.join(sorted(owners))}")
+        # read each account with its own profile; groups / interfaces keep argument order
+        groups, rules, warnings, interfaces, target_warnings = [], {}, [], [], []
+        for account in dict.fromkeys(a or bare_account for a, _, _ in targets):
+            profile = profiles[account][0]
+
+            def session(region, profile=profile):
+                """boto3 session for this account's profile in `region`."""
+                return boto3.Session(profile_name=profile, region_name=region)
+            mine = [(r, rid) for a, r, rid in targets if (a or bare_account) == account]
+            group_targets, entries, tw = resolve_workloads(session, mine)
+            interfaces += [{**e, "account": account} for e in entries]
+            target_warnings += tw
+            if group_targets:
+                gs, rs, ws = load_groups(session, group_targets)
+                groups += [g for g in gs if g.group_id not in rules]
+                rules.update(rs)
+                warnings += ws
+        for w in target_warnings:
+            log.warning("%s", w)
+        if not groups:
+            raise ValueError("no security groups: the targets given have none attached")
     except ValueError as e:
         log.error("%s", e)
         return 2
@@ -1212,18 +1248,24 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
     via = defaultdict(list)
     for n in interfaces:
         for gid in n["groups"]:
-            via[gid].append(n["eni_id"])
-    payload = {"account": caller, "profile": profile, "profile_source": source,
+            via[gid].append(n["id"])
+    accounts = sorted({g.owner for g in groups})
+    used = {a: profiles[a] for a in accounts if a in profiles}
+    payload = {"account": ", ".join(accounts),
+               "accounts": [{"account": a, "profile": p, "profile_source": src} for a, (p, src) in used.items()],
+               "profile": next(iter(used.values()))[0] if len(used) == 1 else None,
+               "profile_source": next(iter(used.values()))[1] if len(used) == 1 else "",
                "generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-               "interfaces": interfaces, "warnings": warnings,
+               "interfaces": interfaces, "warnings": warnings, "target_warnings": target_warnings,
                "groups": [{**asdict(g), "via": via.get(g.group_id, [])} for g in groups],
                "rules": [asdict(r) for r in rows], "combined_access": combined,
                "interface_deltas": interface_deltas(interfaces, rules)}
     tester_text, payload["rule_data_sha256"] = tester_data(payload, groups, rules, pls)
 
     slug = groups[0].group_id if len(groups) == 1 else f"{groups[0].group_id}_and_{len(groups) - 1}_more"
-    if interfaces and len(interfaces) == len(targets):
-        slug = interfaces[0]["eni_id"] if len(interfaces) == 1 else f"{len(interfaces)}_interfaces"
+    workloads = [rid for _, _, rid in targets if not rid.startswith("sg-")]
+    if workloads and len(workloads) == len(targets):
+        slug = workloads[0].replace("lambda:", "") if len(workloads) == 1 else f"{len(workloads)}_targets"
     paths = report_paths(args, TOOL, f"sgrules_{slug}")
     if paths["json"]:
         write_json(paths["json"], payload)
@@ -1238,7 +1280,7 @@ Traffic tests are run in the HTML report (no AWS access needed once it is saved)
         print_report(payload, rows, combined, args.show_rules)
         print_saved(paths)
     deltas = payload["interface_deltas"]
-    return 1 if warnings or deltas["groups"] or deltas["access"] else 0
+    return 1 if warnings or target_warnings or deltas["groups"] or deltas["access"] else 0
 
 
 if __name__ == "__main__":

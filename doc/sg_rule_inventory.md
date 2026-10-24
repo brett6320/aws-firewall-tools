@@ -25,27 +25,47 @@ calls, and the tester runs entirely in the browser.
 # The groups attached to an interface, plus another group
 ./sg_rule_inventory.py arn:aws:ec2:us-east-1:111122223333:network-interface/eni-0123456789abcdef0 \
     sg-0aaaabbbbccccdddd
+
+# An EC2 instance (each of its interfaces) and a Lambda function, in two accounts
+./sg_rule_inventory.py arn:aws:ec2:us-east-1:111122223333:instance/i-0123456789abcdef0 \
+    arn:aws:lambda:us-east-1:444455556666:function:orders-api:live
 ```
 
-Targets:
-- Any number of security group ids or ARNs, and network interface ids or ARNs, mixed. Commas also separate targets.
-- An interface stands for the groups attached to it. The report shows which interface brought in which group.
-- All targets must be in one account. ARNs carry their own region; bare ids use `--region`, then `AWS_REGION`, then the profile's region.
+Targets, any number and mixed. Commas also separate targets.
 
-### Choosing the profile
+| Target | Written as | Stands for |
+|---|---|---|
+| Security group | `sg-…` or its ARN | itself |
+| Network interface | `eni-…` or its ARN | the groups attached to it |
+| EC2 instance | `i-…` or `arn:aws:ec2:REGION:ACCOUNT:instance/i-…` | each of its network interfaces, with that interface's groups |
+| Lambda function | `arn:aws:lambda:REGION:ACCOUNT:function:NAME[:VERSION or ALIAS]` | the security groups in its VPC configuration |
 
-1. `--profile`, if given.
-2. Otherwise, if any ARN names an account, the local profile for that account:
+- The report shows which interface or function brought in which group. Interfaces and functions take part in the interface comparison, see [below](#comparing-interfaces).
+- A Lambda function that is not attached to a VPC has no security groups. It is reported as a warning (exit 1) and skipped.
+- ARNs carry their own region. Bare ids use `--region`, then `AWS_REGION`, then the profile's region.
+
+### Accounts and profiles
+
+Targets can be in several accounts when they are given as ARNs. Each account
+is read with its own profile:
+
+1. `--profile`, if given, is used for its own account.
+2. Every other account named by an ARN uses its local profile:
    - It is found by account id, the same way as the other tools (see [Accounts and profiles](../README.md#accounts-and-profiles)).
    - Profiles ending in `-priv` or `-cpar` are never chosen.
    - `--account-profile ACCOUNT=PROFILE` forces a profile.
-3. Otherwise (bare ids only), `AWS_PROFILE`, then the default credentials.
+3. Bare ids belong to the `--profile` account. Without `--profile`, they belong to the ARNs' account when exactly one account is named, otherwise (no ARNs) to `AWS_PROFILE`, then the default credentials.
 
-The profile's account is checked with `sts:GetCallerIdentity` before anything
-is read. The run stops (exit 2) if:
-- it is not the account in the ARNs;
-- ARNs name more than one account;
-- the groups have different owners.
+Every profile is checked with `sts:GetCallerIdentity` before anything is
+read. The run stops (exit 2) if:
+- an account has no usable profile, or its profile is a different account;
+- bare ids are mixed with ARNs from several accounts and there is no `--profile` to say which account they are in;
+- a target is not found in its account.
+
+With several accounts, the account is shown on every group, rule, interface
+and function, and can be filtered on in the HTML report. Security group
+references across accounts (for example over VPC peering) are matched by
+group id, like any other reference.
 
 ## What the report shows
 
@@ -199,7 +219,7 @@ could recompute the hash.
 | Flag | Description |
 |---|---|
 | `SG_OR_ENI ...` | Group or interface ids / ARNs |
-| `--profile NAME` | AWS profile (default: chosen as [above](#choosing-the-profile)) |
+| `--profile NAME` | AWS profile (default: chosen as [above](#accounts-and-profiles)) |
 | `--region REGION` | Region for bare ids |
 | `--show-rules` | Text report: list every rule per group, the combined access, and each interface difference with its rules. Without it, the text report is a summary: one line per group and counts only. The HTML, CSV and JSON reports always include everything |
 | `--account-profile ACCT=PROFILE` | Force the profile for an account (repeatable) |
@@ -217,14 +237,14 @@ Plus the common output flags, described under [Reports](../README.md#reports).
   - with two or more interfaces, the number of group attachment and access differences, and how many each interface lacks.
 - **Text with `--show-rules`**: additionally, each group's rules by direction (with descriptions and *also granted*), the combined access per direction, and every interface difference with the rules responsible. Long CIDR lists are cut at 8; the files hold everything.
 - **CSV**: one row per rule. List cells are `; `-separated.
-- **JSON**: `{account, profile, profile_source, generated, interfaces, warnings, groups, rules, combined_access, interface_deltas, rule_data_sha256}`. `interface_deltas` holds `{interfaces, groups, access}`.
+- **JSON**: `{account, accounts, profile, profile_source, generated, interfaces, warnings, target_warnings, groups, rules, combined_access, interface_deltas, rule_data_sha256}`. `accounts` lists each account with its profile; `interfaces` holds interfaces and Lambda functions (`kind`: `eni`, `instance` or `lambda`). `interface_deltas` holds `{interfaces, groups, access}`.
 - **HTML**: the sections above.
 
 Reports are saved under `reports/sg_rule_inventory/YYYY-MM-DD/`.
 
 Exit codes:
 - `0`: done.
-- `1`: the interfaces given differ (groups or access), or a referenced prefix list could not be read. Rules using an unreadable prefix list are matched by id only.
+- `1`: the interfaces / functions given differ (groups or access), a Lambda function was skipped (not in a VPC), or a referenced prefix list could not be read. Rules using an unreadable prefix list are matched by id only.
 - `2`: fatal (bad arguments, no usable profile, wrong account, AWS error).
 
 ## IAM permissions
@@ -233,5 +253,7 @@ Exit codes:
 - `ec2:DescribeSecurityGroups`
 - `ec2:DescribeSecurityGroupRules`
 - `ec2:DescribeNetworkInterfaces` (for interfaces)
+- `ec2:DescribeInstances` (for EC2 instances)
+- `lambda:GetFunctionConfiguration` (for Lambda functions)
 - `ec2:DescribeManagedPrefixLists`
 - `ec2:GetManagedPrefixListEntries`

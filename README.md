@@ -22,7 +22,7 @@ have in common.
 | Tool | Question it answers |
 |---|---|
 | [`nacl_shadow.py`](doc/nacl_shadow.md) | Which NACL rules can never take effect, or are partly overridden, because an earlier rule already matches their traffic? |
-| [`sg_rule_inventory.py`](doc/sg_rule_inventory.md) | What do these security groups (or the groups on an interface) allow, together? How do several interfaces differ? Would a given flow be allowed, and what if a rule or group were removed? (interactive tester in the HTML report) |
+| [`sg_rule_inventory.py`](doc/sg_rule_inventory.md) | What do these security groups (or the groups on interfaces, EC2 instances or Lambda functions, across accounts) allow, together? How do several interfaces differ? Would a given flow be allowed, and what if a rule or group were removed? (interactive tester in the HTML report) |
 | [`sg_access_gap.py`](doc/sg_access_gap.md) | What access does one security group grant that one or more others, combined, do not? |
 | [`sg_quota_audit.py`](doc/sg_quota_audit.md) | Which security groups and network interfaces are at or near their quotas, and which groups are stale, unattached, or default groups with rules? |
 | [`prefix_list_audit.py`](doc/prefix_list_audit.md) | Are managed prefix lists full, unused, oversized for the security group rule quota, or different between same-named copies? |
@@ -87,7 +87,7 @@ Tools that look inside member accounts scan the accounts you select:
   - `--profile`'s account by default;
   - `--account ID[,ID]` for specific accounts;
   - `--all-accounts` for every account with a local profile.
-- `sg_rule_inventory` reads one account. Without `--profile`, it uses the local profile for the account named in its ARNs.
+- `sg_rule_inventory` reads the accounts named in its ARNs, each through its local profile (`--profile` is used for its own account).
 
 Each account's profile comes from the local AWS config (`AWS_CONFIG_FILE` is honoured):
 - A profile's account is its `sso_account_id`, `aws_account_id`, or the account in its `role_arn`.
