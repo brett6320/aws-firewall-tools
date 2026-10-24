@@ -64,7 +64,7 @@ flags override them.
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `AWS_PROFILE` | all | Default AWS profile (`--profile` overrides; `sg_rule_inventory` prefers the profile for the account in its ARNs) |
+| `AWS_PROFILE` | all | Default AWS profile (`--profile` overrides). `sg_rule_inventory`, `sg_access_gap` and `sg_migration_check` use it only when no ARN names an account; otherwise each ARN's account uses its own local profile |
 | `AWS_REGION` | all | Default region (`--region` overrides) |
 | `FMM_REPORT_DIR` | all | Base directory for saved reports (default `./reports`) |
 | `FMM_ADMIN_ACCOUNT` | `fmm_*` | FMS administrator (security) account id; its profile is found by account id |
@@ -94,7 +94,7 @@ Each account's profile comes from the local AWS config (`AWS_CONFIG_FILE` is hon
 - A profile's account is its `sso_account_id`, `aws_account_id`, or the account in its `role_arn`.
 - Profiles ending in `-priv` or `-cpar` are never used (`--exclude-profile-suffix` to change).
 - If several profiles match, the first alphabetically is used, with a warning. `--account-profile ACCOUNT=PROFILE` forces one.
-- Every profile is checked with `sts:GetCallerIdentity` before use. An account without a usable profile is reported as a finding and is not scanned.
+- Every profile is checked with `sts:GetCallerIdentity` before use. An account without a usable profile is reported as a finding and skipped by the account-scanning tools (`fmm_nacl_audit`, `nacl_shadow`, `sg_quota_audit`, `prefix_list_audit`); the security group tools stop (exit 2) instead.
 
 ## Reports
 
@@ -109,7 +109,7 @@ reports/
 └── ...
 ```
 
-Common output flags (every tool):
+Common output flags (every tool; `fmm_policy_snapshot snapshot` only writes the snapshot):
 
 | Flag | Effect |
 |---|---|
@@ -139,7 +139,10 @@ Long list cells can show one item per line (table option `lines`).
 | `1` | Findings: gaps, errors or warnings |
 | `2` | Fatal error: bad input, wrong account, or AWS failure that stops the run |
 
-This makes the tools usable in scripts and CI.
+This makes the tools usable in scripts and CI. Some tools define "findings"
+more precisely, as described on their pages. For example:
+- `sg_rule_inventory` exits 1 when the interfaces given differ;
+- `sg_migration_check` exits 0 only when every resource is `READY`.
 
 ## Repository layout
 
@@ -153,14 +156,14 @@ prefix_list_audit.py    managed prefix list capacity, usage and drift
 sg_access_gap.py        left SG access absent from right SG(s)
 sg_migration_check.py   old -> new security group migration: attachments and access change per resource
 sg_quota_audit.py       security group / interface quotas and clean-up candidates
-sg_rule_inventory.py    all rules of a set of groups / interfaces, combined access, access tester
+sg_rule_inventory.py    rules of groups / interfaces / instances / Lambdas, combined access, interface differences, access tester
 doc/                    one page per tool
 lib/accounts.py         account -> profile mapping, account selection, admin profile
 lib/aws_common.py       AWS sessions/clients, FMS policy calls, regions; loads .env, logging
 lib/boxes.py            protocol x port x address range arithmetic (SG / NACL comparisons)
 lib/html_report.py      self-contained interactive HTML report renderer
 lib/output.py           common output flags, report paths and writers
-lib/security_groups.py  group / interface ids and ARNs, profile choice, loading rules and prefix lists
+lib/security_groups.py  group / interface / instance / Lambda ids and ARNs, per-account profiles, loading rules and prefix lists
 .env.example            configuration template
 requirements.txt        Python dependencies
 ```
