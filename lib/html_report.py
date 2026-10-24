@@ -84,11 +84,13 @@ const vals = v => Array.isArray(v) ? v.map(String) : (v === null || v === undefi
 const card = (n, l) => `<div class="card"><b>${esc(n)}</b><span>${esc(l)}</span></div>`;
 const app = document.getElementById("app");
 app.innerHTML = `<h1>${esc(D.title)}</h1>` + (D.meta || []).map(m => `<div class="muted">${esc(m)}</div>`).join("") +
-  `<div class="cards">${(D.cards || []).map(([v, l]) => card(v, l)).join("")}</div>`;
+  `<div class="cards">${(D.cards || []).map(([v, l]) => card(v, l)).join("")}</div>` + (D.extra_html || "");
 const H = new URLSearchParams(location.hash.slice(1));
 const tables = [];
 function saveHash() {
-  const p = new URLSearchParams();
+  // Keep keys that belong to no table (e.g. an extra section's state).
+  const p = new URLSearchParams(location.hash.slice(1));
+  [...p.keys()].filter(k => tables.some(t => k.startsWith(t.id + "."))).forEach(k => p.delete(k));
   tables.forEach(t => t.save(p));
   history.replaceState(null, "", "#" + p.toString());
 }
@@ -213,7 +215,7 @@ function makeTable(t) {
     a.click();
   });
   sync();
-  return {render, save: p => {
+  return {id: t.id, render, save: p => {
     Object.entries(st.f).forEach(([k, v]) => v && p.set(P + k, v));
     if (st.q) p.set(P + "q", st.q);
     if (st.show) p.set(P + "show", "1");
@@ -223,17 +225,35 @@ function makeTable(t) {
 D.tables.forEach(t => tables.push(makeTable(t)));
 tables.forEach(t => t.render());
 })();
-</script></body></html>
+</script>
+<script>__EXTRA_SCRIPT__</script></body></html>
 """
 
 
 def render(title: str, *, meta: list[str] | None = None, cards: list[tuple] | None = None,
-           tables: list[dict]) -> str:
-    """Return the complete HTML document for a report (see the module docstring for the table spec)."""
-    data = {"title": title, "meta": meta or [], "cards": [list(c) for c in cards or []], "tables": tables}
+           tables: list[dict], extra_html: str = "", extra_script: str = "", extra_data=None) -> str:
+    """Return the complete HTML document for a report (see the module docstring for the table spec).
+
+    extra_html is inserted between the summary cards and the tables; extra_script runs after
+    the tables are drawn and can read `extra_data` as JSON from the element #extra-data.
+    """
+    data = {"title": title, "meta": meta or [], "cards": [list(c) for c in cards or []], "tables": tables,
+            "extra_html": extra_html}
     # Inside <script type=application/json>, only "</" can end the element early.
     payload = json.dumps(data, default=str).replace("</", "<\\/")
-    return TEMPLATE.replace("__TITLE__", title.replace("&", "&amp;").replace("<", "&lt;")).replace("__DATA__", payload)
+    extra = ""
+    if extra_data is not None:
+        extra = ('<script id="extra-data" type="application/json">'
+                 + json.dumps(extra_data, default=str).replace("</", "<\\/") + "</script>")
+    # Fill each placeholder once, in template order, so data can never be mistaken for one.
+    out, rest = [], TEMPLATE
+    for marker, value in (("__TITLE__", title.replace("&", "&amp;").replace("<", "&lt;")),
+                          ('<div id="app"></div>', '<div id="app"></div>' + extra),
+                          ("__DATA__", payload),
+                          ("__EXTRA_SCRIPT__", extra_script.replace("</script", "<\\/script"))):
+        head, _, rest = rest.partition(marker)
+        out += [head, value]
+    return "".join(out + [rest])
 
 
 def write(path, title: str, **kw) -> None:

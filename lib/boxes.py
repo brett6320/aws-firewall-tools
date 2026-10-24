@@ -7,7 +7,8 @@ ICMP range, address range); unions, differences and overlaps of boxes then
 answer questions like "what does rule A allow that rules B, C do not" or
 "is this rule fully hidden by earlier rules", down to exact CIDRs and ports.
 
-Used by sg_access_gap.py (security groups) and nacl_shadow.py (NACL entries).
+Used by sg_access_gap.py and sg_rule_inventory.py (security groups) and nacl_shadow.py
+(NACL entries). sg_rule_inventory's HTML tester mirrors subtract() in JavaScript.
 
 Encoding:
   * protocol: IP protocol number 0-255; all traffic is (0, 255)
