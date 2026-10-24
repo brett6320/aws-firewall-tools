@@ -389,7 +389,7 @@ Groups and rules used by the tester: <b data-t="oncount"></b>
 <label style="flex:1 1 320px">Notes<input type="search" data-t="snotes" style="max-width:none;width:100%"
 placeholder="change ticket, purpose, assumptions"></label>
 <button data-t="exphtml">Download scenario report</button><button data-t="expjson">Export scenario JSON</button>
-<button data-t="impbtn">Import scenario JSON</button><input type="file" data-t="impfile" accept=".json,application/json" hidden>
+<button data-t="impbtn">Import scenario</button><input type="file" data-t="impfile" accept=".json,.html,application/json,text/html" hidden>
 </div>
 <div class="cards" data-t="cards"></div>
 <div class="wrap"><table data-t="out"></table></div>
@@ -398,7 +398,7 @@ placeholder="change ticket, purpose, assumptions"></label>
 allowed (compared on the protocol / ports both tests cover), and the rules involved.</div>
 <div class="controls"><label>Test A<select data-t="ca" style="max-width:420px"></select></label>
 <label>Test B<select data-t="cb" style="max-width:420px"></select></label><button data-t="swap">Swap</button>
-<button data-t="cmphtml">Download comparison report</button><button data-t="cmpcsv">Download comparison CSV</button></div>
+<button data-t="cmphtml">Download comparison</button><button data-t="cmpcsv">Download comparison CSV</button></div>
 <div class="wrap"><table data-t="cmp"></table></div>
 </section>
 """
@@ -861,12 +861,62 @@ $("exphtml").addEventListener("click", async () => {
   const sc = await current();
   exportHtml(sc, `sg_scenario_${slug(sc.name)}.html`);
 });
+// The comparison alone: a small static page (no rule data) carrying a compact scenario of just the
+// two tests, which "Import scenario" in the full report re-runs to check it.
+async function comparisonScenario() {
+  const full = await current();
+  if (!full.comparison) return null;
+  const c = full.comparison, tests = [...new Set([c.a.test, c.b.test])].join("\n");
+  const st = {tests, groups_off: full.groups_off, rules_off: full.rules_off, compare: [cmpA, cmpB]};
+  return {...full, ...st, name: full.name || `${c.a.test} vs ${c.b.test}`, focus: "compare",
+          results: evaluate(st), comparison: comparisonOf(st)};
+}
+function comparisonPage(sc) {
+  const c = sc.comparison, r = sc.report || {};
+  const cell = v => Array.isArray(v) ? v.map(esc).join("<br>") : esc(v);
+  const vb = v => BADGE[v] ? `<span class="badge ${BADGE[v]}">${v}</span>` : cell(v);
+  const offG = sc.groups_off || [], offR = sc.rules_off || [];
+  const off = !offG.length && !offR.length ? "nothing: every rule of every group was on"
+    : [...offG.map(g => `group ${g}`), ...offR.map(id => { const x = rules.find(y => y.id === id);
+        return x ? `${x.g} ${x.id} ${x.text}` : id; })].join("; ");
+  const rows = c.rows.map(x => `<tr><td class="w${x.different ? " d" : ""}">${esc(x.what)}${x.different ? " &#9679;" : ""}</td>` +
+    (x.pair ? `<td>${x.what === "Verdict" ? vb(x.a) : cell(x.a)}</td><td>${x.what === "Verdict" ? vb(x.b) : cell(x.b)}</td>`
+            : `<td colspan="2">${cell(x.a)}</td>`) + `</tr>`).join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc("Comparison: " + sc.name)}</title><style>
+:root{--bg:#fff;--fg:#1d2329;--muted:#5b6670;--line:#d9dee3;--card:#f6f8fa;--error:#b42318;--error-bg:#fde8e7;
+--warn:#9a6700;--warn-bg:#fff4d6;--info:#305d9c;--info-bg:#e6effa;--ok:#1a7f37;--ok-bg:#dcf5e3}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1418;--fg:#e3e8ec;--muted:#97a3ad;--line:#2c353d;--card:#161d23;
+--error:#ff8a80;--error-bg:#3d1714;--warn:#f2c14e;--warn-bg:#3a2e0e;--info:#8ab4f8;--info-bg:#14243b;--ok:#6fdc8c;--ok-bg:#12321e}}
+body{background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+margin:0 auto;padding:24px 16px;max-width:1200px}h1{font-size:22px;margin:0 0 6px}.muted{color:var(--muted)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:12px 0}
+table{border-collapse:collapse;width:100%;margin:8px 0}th,td{text-align:left;vertical-align:top;padding:6px 8px;
+border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px}td{font:12.5px ui-monospace,Menlo,Consolas,monospace}
+td.w{white-space:nowrap}td.d{font-weight:600}.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+font-weight:600;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.error{color:var(--error);background:var(--error-bg)}.warn{color:var(--warn);background:var(--warn-bg)}
+.info{color:var(--info);background:var(--info-bg)}.ok{color:var(--ok);background:var(--ok-bg)}
+</style></head><body>
+<h1>Security group test comparison${sc.name ? ": " + esc(sc.name) : ""}</h1>
+${sc.notes ? `<div>${esc(sc.notes)}</div>` : ""}
+<div class="muted">Exported ${esc(sc.exported)} from the sg_rule_inventory report for account ${esc(r.account || "?")}
+generated ${esc(r.generated || "?")}. Source rule data SHA-256 ${esc(r.rule_data_sha256 || "n/a")}.</div>
+<div class="card"><div><b>A:</b> ${esc(c.a.test)} (${esc(c.a.direction)}) &nbsp; <b>B:</b> ${esc(c.b.test)} (${esc(c.b.direction)})</div>
+<div style="margin-top:6px">${c.differences ? `<span class="badge warn">${c.differences} difference(s)</span>`
+  : `<span class="badge ok">same outcome</span> no differences other than the addresses`}</div>
+<div style="margin-top:6px"><b>Switched off:</b> ${esc(off)}</div></div>
+<table><tr><th></th><th>A: ${esc(c.a.test)}</th><th>B: ${esc(c.b.test)}</th></tr>${rows}</table>
+<div class="muted">Addresses are ignored: the comparison covers verdict, the protocol / ports allowed (on the protocol /
+ports both tests cover) and the rules involved. ${esc(SCOPE)}</div>
+<div class="muted" style="margin-top:6px">To verify: open the full report with the same rule data SHA-256 and load this file
+with "Import scenario"; it re-runs both tests and checks the comparison is reproduced.</div>
+<script id="scenario" type="application/json">${JSON.stringify(sc).replace(/<\//g, "<\\/")}</script>
+</body></html>`;
+}
 $("cmphtml").addEventListener("click", async () => {
-  const sc = await current();
-  if (!sc.comparison) return;
-  if (!sc.name) sc.name = `${sc.comparison.a.test} vs ${sc.comparison.b.test}`;
-  sc.focus = "compare";
-  exportHtml(sc, `sg_comparison_${slug(sc.name)}.html`);
+  const sc = await comparisonScenario();
+  if (sc) download(`sg_comparison_${slug(sc.name)}.html`, comparisonPage(sc), "text/html");
 });
 $("cmpcsv").addEventListener("click", async () => {
   const c = (await current()).comparison;
@@ -883,7 +933,10 @@ $("impfile").addEventListener("change", async e => {
   const f = e.target.files[0];
   if (!f) return;
   try {
-    const sc = JSON.parse(await f.text());
+    const text = await f.text();
+    // a scenario JSON, or an exported page (comparison or scenario report) carrying one
+    const m = /<script id="scenario" type="application\/json">([\s\S]*?)<\/script>/.exec(text);
+    const sc = JSON.parse(m ? m[1] : text);
     if (sc.format !== "sg_rule_inventory.scenario/1") throw "not an sg_rule_inventory scenario file";
     setState(sc); run(); evidence(sc, `imported from ${f.name}`);
   } catch (err) { $("evidence").innerHTML = `<div class="card"><span class="badge error">import failed</span> ${esc(String(err))}</div>`; }

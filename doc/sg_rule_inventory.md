@@ -154,8 +154,10 @@ covers (`×3`).
 Rows that differ are marked, with a count at the top; "same outcome" means nothing differs except the addresses. The selected pair is kept in the URL fragment and in exported scenarios.
 
 To share a comparison:
-- **Download comparison report**: a copy of the report that opens on the comparison. It works like a scenario report (see [below](#sharing-a-scenario-as-evidence)): the evidence panel shows the comparison as exported, checks that it is reproduced, and checks the rule data. If no scenario name was given, the name is "A vs B".
+- **Download comparison**: a small standalone page with only the comparison: the two tests, the A / B table, the switched-off rules, the source report's account, generation time and rule data SHA-256, and the scope. It holds no rule data, so it is a few KB rather than the size of the report. If no scenario name was given, the name is "A vs B".
 - **Download comparison CSV**: one line per row (what, A, B, different).
+
+The comparison page also carries a compact scenario of just the two tests and the on / off state. To check it, open the full report with the same rule data SHA-256 and load the comparison file with **Import scenario**. The two tests are re-run, the comparison is recomputed and shown, and the evidence panel says whether it matches the file (see [below](#sharing-a-scenario-as-evidence)). The check covers the comparison's data, not hand edits to the visible table, but the verifier always sees the recomputed comparison in the report.
 
 **Switching groups and rules off.** Every group and rule has a checkbox in the "Groups and rules used by the tester" panel. The panel is collapsed by default; its heading shows how many rules are on.
 Untick one to see what the set would allow without it. "All on" restores
@@ -173,7 +175,7 @@ a name and notes, for example a change ticket, then:
 |---|---|
 | **Download scenario report** | A copy of this HTML report that opens on the scenario. It is a single self-contained file to attach to a ticket or email; the recipient needs nothing else |
 | **Export scenario JSON** | The scenario alone (`format: sg_rule_inventory.scenario/1`): tests, switched-off groups and rules, name, notes, report identity, and the results at export time |
-| **Import scenario JSON** | Loads such a file into a report and checks it the same way |
+| **Import scenario** | Loads a scenario JSON, a downloaded scenario report or a downloaded comparison into a report and checks it the same way |
 
 When a scenario report is opened, or a scenario JSON is imported, a panel at
 the top of the tester shows:
