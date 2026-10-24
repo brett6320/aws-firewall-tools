@@ -201,6 +201,7 @@ could recompute the hash.
 | `SG_OR_ENI ...` | Group or interface ids / ARNs |
 | `--profile NAME` | AWS profile (default: chosen as [above](#choosing-the-profile)) |
 | `--region REGION` | Region for bare ids |
+| `--show-rules` | List every rule in the text report: per group, and the rules behind each interface difference. Without it, the text report shows one line per group. The HTML, CSV and JSON reports always include every rule |
 | `--account-profile ACCT=PROFILE` | Force the profile for an account (repeatable) |
 | `--exclude-profile-suffix LIST` | Profile suffixes never chosen (default `-priv,-cpar`) |
 
@@ -211,9 +212,9 @@ Plus the common output flags, described under [Reports](../README.md#reports).
 - **Text**:
   - which account and profile were used, and the rule data SHA-256;
   - interfaces and their groups;
-  - each group's rules by direction, with descriptions and *also granted*;
+  - one line per group (rule counts, interface); with `--show-rules`, each group's rules by direction, with descriptions and *also granted*;
   - the combined access per direction;
-  - with two or more interfaces, the differences between them.
+  - with two or more interfaces, the differences between them (the responsible rules only with `--show-rules`).
   - Long CIDR lists are cut at 8; the files hold everything.
 - **CSV**: one row per rule. List cells are `; `-separated.
 - **JSON**: `{account, profile, profile_source, generated, interfaces, warnings, groups, rules, combined_access, interface_deltas, rule_data_sha256}`. `interface_deltas` holds `{interfaces, groups, access}`.
