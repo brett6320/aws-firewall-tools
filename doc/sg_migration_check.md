@@ -60,6 +60,16 @@ Groups are ids or ARNs. Accounts and profiles work as in
 
 So the old group's "from self" becoming the new group's "from self" is not a change. Such a reference is shown as `sg-new / sg-old`. `--no-equate-references` turns this off.
 
+## Grouping identical changes
+
+Resources whose change is identical are listed together, once: same status,
+same missing new groups, same access lost and gained, and the same rules
+responsible. For example, every instance in an Auto Scaling group carrying
+the same groups appears as one row (`G1: 12 resources`) with its resources
+listed, instead of twelve repeated rows. The text and HTML reports show
+these groups. The CSV and JSON keep one row per resource, with the group id
+in `change_group`; the JSON also has `change_groups`.
+
 ## Statuses
 
 | Status | Severity | Meaning |
@@ -91,12 +101,15 @@ Plus the common output flags, described under [Reports](../README.md#reports).
 
 - **Text**:
   - accounts, old and new groups, and how references are equated;
-  - one line per resource, with status, type, interface, VPC and how many access changes it has;
+  - one entry per group of resources with identical changes: status, number of resources, and how many access changes; then each resource (type, label, interface, VPC, requester for managed interfaces);
   - rules referencing the old group that are not mirrored;
   - with `--show-changes`, every access change and the rules responsible.
-- **CSV**: one row per resource (interface). List cells are `; `-separated.
-- **JSON**: `{generated, accounts, old, new, rename, groups, warnings, resources, references}`.
-- **HTML**: resources (filter by severity, status, type, account, VPC, new group missing; summary by status) and references. Full window width.
+- **CSV**: one row per resource (interface), with its `change_group`. List cells are `; `-separated.
+- **JSON**: `{generated, accounts, old, new, rename, groups, warnings, resources, change_groups, references}`.
+- **HTML**:
+  - one row per group of identical changes, with its resources, filterable by severity, status, type, account, VPC and missing new group, plus a summary by status;
+  - the references.
+  - Full window width.
 
 Reports are saved under `reports/sg_migration_check/YYYY-MM-DD/`.
 

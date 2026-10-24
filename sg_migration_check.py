@@ -44,6 +44,10 @@ sg_rule_inventory.py: --profile for its own account, other accounts named by
 ARNs through their local profiles (never -priv / -cpar), bare ids in the
 --profile account, else the single ARN account, else AWS_PROFILE / default.
 
+Resources whose change is identical (status, access lost / gained, rules
+responsible) are listed together as one group in the text and HTML reports;
+the CSV / JSON keep one row per resource with its group id.
+
 Reports: text summary on screen (--show-changes lists the access changes),
 plus auto-saved HTML (interactive: filter by status, resource type, VPC ...),
 CSV (one row per resource) and JSON under reports/sg_migration_check/DATE/.
@@ -220,6 +224,8 @@ class ResourceRow:
     projected_lost: list[str] = field(default_factory=list)    # new attached + old removed
     projected_gained: list[str] = field(default_factory=list)
     detail: str = ""
+    managed_by: str = ""             # requester of a requester-managed interface
+    change_group: str = ""           # resources with identical access changes share a group (G1, G2 ...)
 
 
 CSV_COLUMNS = list(ResourceRow.__dataclass_fields__)
@@ -247,7 +253,9 @@ def review(n: dict, account: str, region: str, olds: list[str], news: list[str],
     vpc = n.get("VpcId", "")
     other_vpc = [g for g in news if g in groups and groups[g].vpc_id and groups[g].vpc_id != vpc]
     if other_vpc:
-        status, sev, detail = "NEW_IN_OTHER_VPC", "error", f"{', '.join(other_vpc)} not in {vpc}; cannot be attached here"
+        status, sev, detail = "NEW_IN_OTHER_VPC", "error", (
+            "; ".join(f"{g} is in {groups[g].vpc_id}" for g in other_vpc) +
+            ", not the resource's VPC; cannot be attached here")
     elif not new_missing:
         status, sev, detail = (("ACCESS_LOST", "error", "new group attached, but removing the old group loses access")
                                if lost else ("READY", "info", "new group attached; removing the old group loses nothing"))
@@ -258,10 +266,33 @@ def review(n: dict, account: str, region: str, olds: list[str], news: list[str],
     else:
         status, sev, detail = "OLD_REDUNDANT", "warn", ("new group not attached, but removing the old group loses "
                                                         "nothing: other groups attached already grant its access")
-    if n.get("RequesterManaged"):
-        detail += f"; requester-managed by {n.get('RequesterId', '?')}: change it through that service"
     return ResourceRow(sev, status, rtype, label, n["NetworkInterfaceId"], account, region, vpc, cur, old_here,
-                       new_here, new_missing, lost, lost_rules, plost, pgained, detail)
+                       new_here, new_missing, lost, lost_rules, plost, pgained, detail,
+                       n.get("RequesterId", "?") if n.get("RequesterManaged") else "")
+
+
+def change_groups(rows: list[ResourceRow]) -> list[dict]:
+    """Resources whose access change is identical (status, missing new groups, access lost /
+    gained and the rules responsible) as one group each; sets each row's change_group."""
+    groups: dict[str, list[ResourceRow]] = {}
+    for r in sorted(rows, key=lambda r: (SEVERITY_ORDER[r.severity], r.status, r.resource_type, r.resource, r.eni_id)):
+        key = json.dumps([r.status, r.new_missing, r.lost, r.lost_rules, r.projected_lost, r.projected_gained, r.detail])
+        groups.setdefault(key, []).append(r)
+    out = []
+    for i, rs in enumerate(groups.values(), 1):
+        gid, r = f"G{i}", rs[0]
+        for x in rs:
+            x.change_group = gid
+        out.append({
+            "change_group": gid, "severity": r.severity, "status": r.status, "count": len(rs),
+            "resources": [f"{x.resource_type} {x.resource} ({x.eni_id}, {x.vpc_id}"
+                          + (f", managed by {x.managed_by}" if x.managed_by else "") + ")" for x in rs],
+            "resource_types": sorted({x.resource_type for x in rs}), "vpcs": sorted({x.vpc_id for x in rs}),
+            "accounts": sorted({x.account for x in rs}), "new_missing": r.new_missing, "lost": r.lost,
+            "lost_rules": r.lost_rules, "projected_lost": r.projected_lost, "projected_gained": r.projected_gained,
+            "detail": r.detail + ("; requester-managed interfaces are changed through their service"
+                                  if any(x.managed_by for x in rs) else "")})
+    return out
 
 
 def check_references(by_group: dict[str, list[dict]], old_ids: list[str], account: str, region: str,
@@ -302,8 +333,9 @@ def cut(lines: list[str]) -> list[str]:
     return out
 
 
-def print_report(payload: dict, rows: list[ResourceRow], refs: list[dict], show: bool) -> None:
-    """Summary per resource; access changes and responsible rules only with `show`."""
+def print_report(payload: dict, rows: list[ResourceRow], cgroups: list[dict], refs: list[dict], show: bool) -> None:
+    """Summary per group of resources with identical access changes; the changes and responsible
+    rules only with `show`."""
     print()
     for a in payload["accounts"]:
         print(f"account {a['account']} via {('profile ' + a['profile']) if a['profile'] else 'default credentials'} "
@@ -318,17 +350,20 @@ def print_report(payload: dict, rows: list[ResourceRow], refs: list[dict], show:
         counts[r.status] += 1
     print(f"\n{len(rows)} resource(s) with an old group attached: " +
           (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none"))
-    for r in sorted(rows, key=lambda r: (SEVERITY_ORDER[r.severity], r.status, r.resource_type, r.resource)):
-        extra = f"  lost: {len(r.lost)}" if r.lost else ""
-        if r.new_missing:
-            extra += f"  if new attached: -{len(r.projected_lost)} / +{len(r.projected_gained)}"
-        print(f"  [{r.severity.upper():<5}] {r.status:<17} {r.resource_type:<14} {r.resource} ({r.eni_id}, "
-              f"{r.vpc_id}){extra}")
+    if rows:
+        print(f"{len(cgroups)} distinct change(s); resources with identical changes are listed together")
+    for g in cgroups:
+        extra = f"  lost: {len(g['lost'])}" if g["lost"] else ""
+        if g["new_missing"]:
+            extra += f"  if new attached: -{len(g['projected_lost'])} / +{len(g['projected_gained'])}"
+        print(f"  [{g['severity'].upper():<5}] {g['status']:<17} {g['change_group']}: {g['count']} resource(s){extra}")
+        for x in g["resources"]:
+            print(f"      {x}")
         if show:
-            print(f"      {r.detail}")
-            for title, xs in (("lost if old removed", r.lost), ("old rules responsible", r.lost_rules),
-                              ("if new attached, lost", r.projected_lost),
-                              ("if new attached, gained", r.projected_gained)):
+            print(f"      {g['detail']}")
+            for title, xs in (("lost if old removed", g["lost"]), ("old rules responsible", g["lost_rules"]),
+                              ("if new attached, lost", g["projected_lost"]),
+                              ("if new attached, gained", g["projected_gained"])):
                 for x in (cut(xs) if "rules" not in title else xs):
                     print(f"      {title}: {x}")
     if refs:
@@ -340,29 +375,31 @@ def print_report(payload: dict, rows: list[ResourceRow], refs: list[dict], show:
         print("(--show-changes lists the access lost / gained per resource and the rules responsible)")
 
 
-def render_html(payload: dict, rows: list[ResourceRow], refs: list[dict]) -> str:
-    """Interactive HTML: resources (filter by status, type, VPC ...) and references."""
+def render_html(payload: dict, rows: list[ResourceRow], cgroups: list[dict], refs: list[dict]) -> str:
+    """Interactive HTML: one row per group of resources with identical access changes (filter by
+    status, type, VPC ...) and the references."""
     status_badge = {"READY": "ok", "ACCESS_LOST": "error", "NEW_NOT_ATTACHED": "error", "NEW_IN_OTHER_VPC": "error",
                     "OLD_REDUNDANT": "warn", "REFERENCE_NOT_MIRRORED": "warn", "REFERENCE_MIRRORED": "ok"}
     tables = [{
-        "id": "r", "title": "Resources with an old group attached", "row_label": "interfaces",
-        "note": "Lost = access the resource loses when the old group is removed from the groups attached today. "
-                "Projected = if the missing new group were attached and the old removed. References to an old "
-                "group count as references to its new group" + ("." if payload["rename"] else " (off)."),
-        "columns": [["severity", "Severity"], ["status", "Status"], ["resource_type", "Type"], ["resource", "Resource"],
-                    ["eni_id", "Interface"], ["account", "Account"], ["vpc_id", "VPC"], ["groups", "Groups attached"],
-                    ["new_missing", "New not attached"], ["lost", "Lost if old removed"],
+        "id": "r", "title": "Resources with an old group attached", "row_label": "distinct changes",
+        "note": "Resources with identical access changes share a row. Lost = access lost when the old group is "
+                "removed from the groups attached today. Projected = if the missing new group were attached and "
+                "the old removed. References to an old group count as references to its new group"
+                + ("." if payload["rename"] else " (off).") + " The CSV / JSON have one row per resource.",
+        "columns": [["severity", "Severity"], ["status", "Status"], ["count", "Resources"],
+                    ["resources", "Resources (interface, VPC)"], ["resource_types", "Types"], ["vpcs", "VPCs"],
+                    ["accounts", "Accounts"], ["new_missing", "New not attached"], ["lost", "Lost if old removed"],
                     ["lost_rules", "Old rules responsible"], ["projected_lost", "If new attached: lost"],
                     ["projected_gained", "If new attached: gained"], ["detail", "Detail"]],
-        "rows": [asdict(r) for r in rows],
-        "filters": ["severity", "status", "resource_type", "account", "vpc_id", "new_missing"],
-        "wrap": ["groups", "lost", "lost_rules", "projected_lost", "projected_gained", "detail", "resource"],
+        "rows": cgroups,
+        "filters": ["severity", "status", "resource_types", "accounts", "vpcs", "new_missing"],
+        "wrap": ["resources", "lost", "lost_rules", "projected_lost", "projected_gained", "detail"],
         "badges": {"severity": SEVERITY_BADGES, "status": status_badge},
         "order": {"severity": list(SEVERITY_ORDER)},
-        "lines": ["groups", "lost", "lost_rules", "projected_lost", "projected_gained"],
-        "uniq": [["resource", "resources"], ["resource_type", "types"], ["vpc_id", "VPCs"], ["account", "accounts"]],
+        "lines": ["resources", "lost", "lost_rules", "projected_lost", "projected_gained"],
+        "uniq": [["resources", "resources"], ["resource_types", "types"], ["vpcs", "VPCs"], ["accounts", "accounts"]],
         "by": {"key": "status", "label": "By status", "badge": "severity"},
-        "sort": [["severity", 1], ["status", 1], ["resource_type", 1]]}]
+        "sort": [["severity", 1], ["status", 1], ["count", -1]]}]
     if refs:
         tables.append({
             "id": "x", "title": "Rules in other groups that reference an old group", "row_label": "rules",
@@ -375,7 +412,8 @@ def render_html(payload: dict, rows: list[ResourceRow], refs: list[dict]) -> str
     counts = defaultdict(int)
     for r in rows:
         counts[r.status] += 1
-    cards = [(len(rows), "interfaces"), (len({r.resource for r in rows}), "resources")] + [(v, k) for k, v in sorted(counts.items())] + \
+    cards = [(len(rows), "interfaces"), (len({r.resource for r in rows}), "resources"),
+             (len(cgroups), "distinct changes")] + [(v, k) for k, v in sorted(counts.items())] + \
         ([(sum(x["status"] == "REFERENCE_NOT_MIRRORED" for x in refs), "references not mirrored")] if refs else [])
     meta = ["Accounts: " + "; ".join(f"{a['account']} via {a['profile'] or 'default credentials'}" for a in payload["accounts"]),
             f"Old: {', '.join(payload['old'])} · New: {', '.join(payload['new'])} · generated {payload['generated']} · "
@@ -475,23 +513,24 @@ def main() -> int:
         return 2
 
     rows = [review(n, a, r, old_ids, new_ids, groups, rules, rename) for a, r, n in interfaces]
+    cgroups = change_groups(rows)
     used = sorted({a for a, _, _ in olds + news})
     payload = {"generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                "accounts": [{"account": a, "profile": profiles[a][0], "profile_source": profiles[a][1]} for a in used],
                "old": old_ids, "new": new_ids, "rename": {o: n for o, n in pairs.items()} if rename else {},
                "groups": [asdict(g) for g in groups.values()], "warnings": warnings,
-               "resources": [asdict(r) for r in rows], "references": refs}
+               "resources": [asdict(r) for r in rows], "change_groups": cgroups, "references": refs}
     paths = report_paths(args, TOOL, f"sgmigration_{old_ids[0]}_to_{new_ids[0]}")
     if paths["json"]:
         write_json(paths["json"], payload)
     if paths["csv"]:
         write_csv(paths["csv"], [asdict(r) for r in rows], CSV_COLUMNS)
     if paths["html"]:
-        write_text(paths["html"], render_html(payload, rows, refs))
+        write_text(paths["html"], render_html(payload, rows, cgroups, refs))
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
     else:
-        print_report(payload, rows, refs, args.show_changes)
+        print_report(payload, rows, cgroups, refs, args.show_changes)
         print_saved(paths)
     ok = all(r.status == "READY" for r in rows) and not any(x["status"] == "REFERENCE_NOT_MIRRORED" for x in refs)
     return 0 if ok and not warnings else 1
